@@ -1,0 +1,23 @@
+{
+  "name": "autoprover",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "description": "A resumable, parallel research loop for attacking open mathematics problems.",
+  "scripts": {
+    "check": "find src test -type f \\( -name '*.js' -o -name '*.mjs' \\) -exec node --check {} \\;",
+    "campaign": "node src/cli.mjs campaign",
+    "dashboard": "node src/dashboard-server.mjs",
+    "dashboard:build": "npm --prefix dashboard run build",
+    "doctor": "node src/cli.mjs doctor",
+    "discover": "node src/cli.mjs discover",
+    "manual": "node src/pro-manual-cli.mjs",
+    "start": "node src/cli.mjs run",
+    "status": "node src/cli.mjs status",
+    "smoke": "node src/cli.mjs smoke",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

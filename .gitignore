@@ -1,0 +1,21 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+node_modules/
+runs/
+config.json
+*.log
+
+# Generated web artifacts
+dist/
+.next/
+.wrangler/
+*.tsbuildinfo
+coverage/
+
+# Local deployment metadata
+dashboard/.openai/hosting.json
+
+# Local launch assets (screenshots, generated clips, and rendered video)
+release/

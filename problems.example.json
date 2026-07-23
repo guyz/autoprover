@@ -1,0 +1,24 @@
+{
+  "problems": [
+    {
+      "id": "replace-me",
+      "title": "Replace with an exact open problem",
+      "domain": "combinatorics",
+      "statement": "Insert the exact statement, including every quantifier and assumption.",
+      "assumptions": [],
+      "sourceUrls": ["https://example.com/canonical-source"],
+      "openStatusEvidence": ["Explain why this exact variant is open and date the check."],
+      "knownResults": [],
+      "verificationMode": "finite-witness",
+      "interest": 3,
+      "tractability": 4,
+      "verifiability": 5,
+      "sourceQuality": 4,
+      "falsificationType": "not-applicable",
+      "counterexampleSearchability": 0,
+      "counterexampleVerificationPlan": "Explain a concrete, decisive counterexample search and checker, or state why counterexamples are not applicable.",
+      "whyPromising": "Explain the agent-accessible attack surface.",
+      "risks": []
+    }
+  ]
+}

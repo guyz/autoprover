@@ -1,0 +1,100 @@
+{
+  "provider": "auto",
+  "runRoot": "runs",
+  "wallClockHours": 12,
+  "parallelProblems": 2,
+  "branchesPerProblem": 3,
+  "maxConcurrentCalls": 4,
+  "maxCalls": 60,
+  "maxEstimatedUsd": 100,
+  "maxTurnsPerBranch": 8,
+  "maxNoProgressEpochs": 2,
+  "maxPortfolioStagnationRounds": 3,
+  "maxRepairCycles": 2,
+  "maxReframesPerBranch": 2,
+  "maxBranchesPerProblem": 6,
+  "maxTurnsPerSession": 3,
+  "independentVerificationPasses": 2,
+  "roundCooldownSeconds": 0,
+  "campaign": {
+    "maxCycles": 0,
+    "refreshEveryCycles": 1,
+    "refreshBackoffMinutes": 15,
+    "catalogTtlHours": 168,
+    "leaseMinutes": 180,
+    "retryCooldownHours": 24,
+    "switchCooldownMinutes": 60,
+    "maxAttemptsPerProblem": 2,
+    "stopOnCandidate": false
+  },
+  "discovery": {
+    "poolSize": 12,
+    "attackCount": 2,
+    "domains": [],
+    "minimumInterest": 2,
+    "minimumTractability": 3,
+    "minimumVerifiability": 3
+  },
+  "models": {
+    "scout": {
+      "model": "gpt-5.6-sol",
+      "mode": "standard",
+      "effort": "high"
+    },
+    "planner": {
+      "model": "gpt-5.6-sol",
+      "mode": "standard",
+      "effort": "max"
+    },
+    "solver": {
+      "model": "gpt-5.6-sol",
+      "mode": "pro",
+      "effort": "max"
+    },
+    "critic": {
+      "model": "gpt-5.6-sol",
+      "mode": "pro",
+      "effort": "max"
+    },
+    "synthesizer": {
+      "model": "gpt-5.6-sol",
+      "mode": "standard",
+      "effort": "max"
+    }
+  },
+  "responses": {
+    "pollIntervalSeconds": 5,
+    "requestTimeoutMinutes": 120,
+    "maxOutputTokens": 64000,
+    "codeInterpreterMemory": "4g"
+  },
+  "codex": {
+    "binary": "codex",
+    "sandbox": "workspace-write",
+    "turnTimeoutMinutes": 120,
+    "effort": "max",
+    "subscriptionOnly": true
+  },
+  "claude": {
+    "binary": "claude",
+    "defaultModel": "claude-fable-5",
+    "effort": "max",
+    "permissionMode": "auto",
+    "turnTimeoutMinutes": 120,
+    "subscriptionOnly": true,
+    "safeMode": true,
+    "disableSlashCommands": true,
+    "respectRequestTools": true
+  },
+  "proManual": {
+    "pollIntervalSeconds": 1,
+    "waitForResponse": false,
+    "queueDir": null
+  },
+  "pricingPerMillionTokens": {
+    "input": 5,
+    "cachedInput": 0.5,
+    "cacheWrite": 6.25,
+    "output": 30
+  }
+}

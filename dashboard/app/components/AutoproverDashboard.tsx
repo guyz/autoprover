@@ -1,7 +1,6 @@
 "use client";
 
 import {
-  type CSSProperties,
   type FormEvent,
   useEffect,
   useRef,
@@ -18,16 +17,7 @@ type Campaign = {
   provider: string;
   parallelProblems?: number;
   maxConcurrentCalls?: number;
-  problemSlots?: {
-    configured?: number;
-    occupied?: number;
-    running?: number;
-    paused?: number;
-  };
-  startedAt: string;
-  deadlineAt: string;
   timeLeftMs: number;
-  stopRequestedAt?: string | null;
   latestNote?: string;
   budget: {
     callsStarted: number;
@@ -35,7 +25,6 @@ type Campaign = {
     callsFailed: number;
     inFlight?: number;
     maxCalls: number;
-    estimatedUsd?: number;
   };
 };
 
@@ -43,9 +32,6 @@ type DashboardCounts = {
   catalog: number;
   queued: number;
   active: number;
-  paused?: number;
-  cooldown?: number;
-  finished?: number;
   candidates: number;
   reproduced: number;
 };
@@ -53,15 +39,12 @@ type DashboardCounts = {
 type CatalogAttempt = {
   attemptId: string;
   outcome: string;
-  startedAt?: string;
-  completedAt?: string;
   activeWorkMs: number;
   callsStarted: number;
   rounds: number;
   evidenceCount: number;
-  candidateKind?: string | null;
   note?: string;
-  problemStatus?: string;
+  candidateKind?: string | null;
   hasCandidate?: boolean;
   hasVerifiedPartial?: boolean;
 };
@@ -73,50 +56,28 @@ type CatalogProblem = {
   rank: number;
   state: string;
   lifecycle?: string;
-  cooldownUntil?: string | null;
-  interest: number;
-  solvability: number;
-  priority: number;
-  falsificationType?: string;
-  counterexampleSearchability?: number;
-  counterexampleOpportunity?: number;
-  counterexampleBonus?: number;
-  counterexampleVerificationPlan?: string;
   selectionReason: string;
-  lastVettedAt?: string;
-  attemptCount?: number;
   lastOutcome?: string;
   attemptHistory?: CatalogAttempt[];
   totalActiveWorkMs?: number;
   totalCalls?: number;
-  failedAttemptCount?: number;
-  interruptedAttemptCount?: number;
   operatorPinned?: boolean;
-  workerSlot?: string;
 };
 
-type BranchDelta = {
-  summary?: string;
-  progressKind?: string;
-  nextAction?: string;
-};
-
-type BranchAttempt = {
+type Branch = {
   id: string;
   title: string;
-  hypothesis?: string;
-  falsifier?: string;
   status: string;
   turn: number;
   round: number;
   latestSummary?: string;
   progressKind?: string;
   nextAction?: string;
+  hypothesis?: string;
+  falsifier?: string;
   feedback?: string;
   verifiedFactsCount?: number;
   failedApproachesCount?: number;
-  noProgressEpochs?: number;
-  history?: BranchDelta[];
 };
 
 type VerificationPass = {
@@ -132,23 +93,19 @@ type VerificationRun = {
   passes: VerificationPass[];
 };
 
-type ActiveProblem = {
+type ResearchProblem = {
   id: string;
   attemptId?: string;
   title: string;
   domain: string;
   status: string;
-  stage?: string;
-  pauseReason?: string | null;
-  workerSlot?: string;
-  round: number;
   activeWorkMs: number;
   callsStarted?: number;
-  switchRequestedAt?: string | null;
   coordinatorNote?: string;
   statement?: string;
   sourceUrls?: string[];
-  branches: BranchAttempt[];
+  switchRequestedAt?: string | null;
+  branches: Branch[];
   verification?: VerificationRun[];
   verificationRuns?: VerificationRun[];
 };
@@ -160,15 +117,18 @@ type ResearchEvent = {
   kind: string;
   title: string;
   note: string;
-  problemId?: string;
-  branchId?: string;
 };
 
 type ManualPacket = {
   packetId: string;
   role?: string;
   prompt?: string;
-  waitingSince?: string;
+};
+
+type OperatorCommand = {
+  id: string;
+  type: string;
+  status: string;
 };
 
 type DashboardServer = {
@@ -180,22 +140,13 @@ type DashboardServer = {
   }>;
 };
 
-type OperatorCommand = {
-  id: string;
-  type: string;
-  status: string;
-  createdAt: string;
-  problemKey?: string | null;
-  query?: string | null;
-  error?: string | null;
-};
-
 type DashboardData = {
   server: DashboardServer;
   campaign: Campaign | null;
   counts: DashboardCounts;
   catalog: CatalogProblem[];
-  activeProblems: ActiveProblem[];
+  activeProblems: ResearchProblem[];
+  completedProblems: ResearchProblem[];
   events: ResearchEvent[];
   manualQueue: ManualPacket[];
   operatorCommands: OperatorCommand[];
@@ -206,6 +157,23 @@ type CampaignSettings = {
   hours: number;
   parallelProblems: number;
   maxCalls: number;
+};
+
+type ProblemState =
+  | "working"
+  | "verifying"
+  | "candidate"
+  | "solved"
+  | "no-solution"
+  | "failed"
+  | "paused"
+  | "waiting";
+
+type ProblemView = {
+  catalog: CatalogProblem;
+  live?: ResearchProblem;
+  saved?: ResearchProblem;
+  state: ProblemState;
 };
 
 const EMPTY_DATA: DashboardData = {
@@ -220,310 +188,8 @@ const EMPTY_DATA: DashboardData = {
   },
   catalog: [],
   activeProblems: [],
+  completedProblems: [],
   events: [],
-  manualQueue: [],
-  operatorCommands: [],
-};
-
-const DEMO_DATA: DashboardData = {
-  server: { commandToken: null },
-  campaign: {
-    id: "campaign-demo-0723",
-    status: "running",
-    phase: "attacking",
-    cycle: 3,
-    provider: "max",
-    startedAt: "2026-07-23T11:08:00.000Z",
-    deadlineAt: "2026-07-24T11:08:00.000Z",
-    timeLeftMs: 7 * 3_600_000 + 42 * 60_000,
-    latestNote:
-      "Two branches produced new information this round; the coordinator is merging one finite-search lead before the next pass.",
-    budget: {
-      callsStarted: 31,
-      callsCompleted: 28,
-      callsFailed: 1,
-      maxCalls: 60,
-    },
-  },
-  counts: {
-    catalog: 84,
-    queued: 17,
-    active: 2,
-    candidates: 1,
-    reproduced: 0,
-  },
-  catalog: [
-    {
-      id: "lonely-runner",
-      title: "Lonely Runner Conjecture",
-      domain: "Diophantine approximation",
-      rank: 1,
-      state: "active",
-      interest: 5,
-      solvability: 4.1,
-      priority: 91,
-      selectionReason:
-        "High mathematical interest with finite reductions that support exact search and falsifiable intermediate claims.",
-      lastVettedAt: "2026-07-23T10:42:00.000Z",
-      attemptCount: 2,
-      workerSlot: "Worker slot 1",
-    },
-    {
-      id: "union-closed",
-      title: "Union-Closed Sets Conjecture",
-      domain: "Extremal combinatorics",
-      rank: 2,
-      state: "active",
-      interest: 4.8,
-      solvability: 3.9,
-      priority: 86,
-      selectionReason:
-        "Recent structural bounds create several independently testable routes without requiring a full formalization stack.",
-      lastVettedAt: "2026-07-23T10:46:00.000Z",
-      attemptCount: 1,
-      workerSlot: "Worker slot 2",
-    },
-    {
-      id: "erdos-straus",
-      title: "Erdős–Straus Conjecture",
-      domain: "Number theory",
-      rank: 3,
-      state: "queued",
-      interest: 4.6,
-      solvability: 3.6,
-      priority: 81,
-      selectionReason:
-        "Exact modular computation is cheap, but a useful attack needs a genuinely new residue-class argument.",
-      lastVettedAt: "2026-07-23T10:51:00.000Z",
-      attemptCount: 0,
-    },
-    {
-      id: "graceful-tree",
-      title: "Graceful Tree Conjecture",
-      domain: "Graph theory",
-      rank: 4,
-      state: "queued",
-      interest: 4.2,
-      solvability: 3.7,
-      priority: 79,
-      selectionReason:
-        "Searchable finite families and constructive subcases give the agents measurable progress signals.",
-      lastVettedAt: "2026-07-23T10:55:00.000Z",
-      attemptCount: 0,
-    },
-    {
-      id: "hadwiger-nelson",
-      title: "Plane Chromatic Number",
-      domain: "Discrete geometry",
-      rank: 5,
-      state: "cooldown",
-      interest: 5,
-      solvability: 2.8,
-      priority: 75,
-      selectionReason:
-        "Exceptionally interesting, but prior cycles found no tractable improvement beyond known finite constructions.",
-      lastVettedAt: "2026-07-22T18:30:00.000Z",
-      attemptCount: 3,
-      lastOutcome: "No new information after three portfolio rounds",
-    },
-  ],
-  activeProblems: [
-    {
-      id: "lonely-runner",
-      title: "Lonely Runner Conjecture",
-      domain: "Diophantine approximation",
-      status: "active",
-      round: 4,
-      activeWorkMs: 3 * 3_600_000 + 18 * 60_000,
-      coordinatorNote:
-        "The torus-covering and obstruction-search branches now share the same six-runner boundary case. Keep the computational branch independent; ask the structural branch to explain why the observed gap pattern must persist.",
-      statement:
-        "For any finite set of runners with distinct constant speeds on a unit circular track, each runner is at some time at distance at least 1/n from every other runner, where n is the number of runners.",
-      sourceUrls: ["https://en.wikipedia.org/wiki/Lonely_runner_conjecture"],
-      branches: [
-        {
-          id: "torus-cover",
-          title: "Torus-covering reformulation",
-          hypothesis:
-            "A minimal uncovered point forces a rigid ordering of the critical coordinate hyperplanes.",
-          falsifier:
-            "An exact six-speed instance whose uncovered cells violate the proposed ordering.",
-          status: "running",
-          turn: 4,
-          round: 4,
-          latestSummary:
-            "Reduced the remaining obstruction to two boundary cell types and verified the reduction symbolically for dimensions four and five.",
-          progressKind: "verified fact",
-          nextAction: "deepen",
-          feedback:
-            "Prove that the second cell type cannot be minimal; do not reuse the numerical-volume argument.",
-          verifiedFactsCount: 7,
-          failedApproachesCount: 2,
-          noProgressEpochs: 0,
-        },
-        {
-          id: "finite-obstruction",
-          title: "Exact finite obstruction search",
-          hypothesis:
-            "Every minimal six-runner obstruction has a representative below the current denominator bound.",
-          falsifier:
-            "A certified feasible obstruction outside the enumerated normal forms.",
-          status: "verifying",
-          turn: 3,
-          round: 4,
-          latestSummary:
-            "Generated 1,284 normal forms and isolated one candidate lemma connecting denominator growth to a forbidden gap cycle.",
-          progressKind: "candidate",
-          nextAction: "verify",
-          feedback:
-            "Reproduce the normal-form count from a fresh script before sharing the lemma with other branches.",
-          verifiedFactsCount: 4,
-          failedApproachesCount: 1,
-          noProgressEpochs: 0,
-        },
-        {
-          id: "gap-extremal",
-          title: "Extremal gap argument",
-          hypothesis:
-            "The largest cyclic gap admits a compression that preserves loneliness constraints.",
-          falsifier:
-            "A primitive speed tuple for which every compression loses a critical witness time.",
-          status: "reframing",
-          turn: 3,
-          round: 3,
-          latestSummary:
-            "The compression claim fails for an exact five-speed tuple; the counterexample prunes the original induction.",
-          progressKind: "refuted path",
-          nextAction: "reframe",
-          feedback:
-            "Restart from the counterexample’s symmetry rather than repairing the failed compression.",
-          verifiedFactsCount: 2,
-          failedApproachesCount: 4,
-          noProgressEpochs: 2,
-        },
-      ],
-      verification: [
-        {
-          candidateHash: "f2d7c81a",
-          candidateClaim:
-            "Every normalized six-runner obstruction below denominator 48 contains a forbidden gap cycle.",
-          status: "checking",
-          passes: [
-            {
-              pass: 1,
-              verdict: "pass",
-              note: "Independent exact enumeration reproduced all 1,284 normal forms.",
-            },
-            {
-              pass: 2,
-              verdict: "running",
-              note: "Auditing completeness of the normalization map.",
-            },
-          ],
-        },
-      ],
-    },
-    {
-      id: "union-closed",
-      title: "Union-Closed Sets Conjecture",
-      domain: "Extremal combinatorics",
-      status: "active",
-      round: 3,
-      activeWorkMs: 2 * 3_600_000 + 46 * 60_000,
-      coordinatorNote:
-        "One entropy inequality survived small-family checks. The next round is separating a genuinely stronger lemma from a restatement of the known averaging bound.",
-      branches: [
-        {
-          id: "entropy",
-          title: "Entropy deficit",
-          status: "running",
-          turn: 3,
-          round: 3,
-          latestSummary:
-            "Found an exact deficit identity for separating families and confirmed it on all reduced families through size 11.",
-          progressKind: "verified fact",
-          nextAction: "deepen",
-          feedback: "State the equality conditions before attempting the global bound.",
-          verifiedFactsCount: 5,
-          failedApproachesCount: 1,
-        },
-        {
-          id: "minimal-counterexample",
-          title: "Minimal-counterexample structure",
-          status: "running",
-          turn: 2,
-          round: 3,
-          latestSummary:
-            "Pruned two proposed frequency profiles using exact closure constraints.",
-          progressKind: "search pruning",
-          nextAction: "branch",
-          feedback: "Fork the remaining asymmetric profile into its own isolated search.",
-          verifiedFactsCount: 3,
-          failedApproachesCount: 2,
-        },
-      ],
-      verification: [],
-    },
-  ],
-  events: [
-    {
-      id: "evt-7",
-      at: "2026-07-23T15:22:00.000Z",
-      level: "warning",
-      kind: "coordinator",
-      title: "Gap argument is being reframed",
-      note: "An exact counterexample invalidated the branch’s compression step. The failed route was recorded and the next attempt starts from a fresh representation.",
-      problemId: "lonely-runner",
-      branchId: "gap-extremal",
-    },
-    {
-      id: "evt-6",
-      at: "2026-07-23T15:18:00.000Z",
-      level: "success",
-      kind: "verification",
-      title: "First independent check passed",
-      note: "A fresh enumeration reproduced all 1,284 finite normal forms. Completeness of the normalization is still under audit.",
-      problemId: "lonely-runner",
-      branchId: "finite-obstruction",
-    },
-    {
-      id: "evt-5",
-      at: "2026-07-23T15:11:00.000Z",
-      level: "info",
-      kind: "research",
-      title: "Entropy branch added a verified identity",
-      note: "The identity passed exact checks on every reduced union-closed family through size 11.",
-      problemId: "union-closed",
-      branchId: "entropy",
-    },
-    {
-      id: "evt-4",
-      at: "2026-07-23T15:02:00.000Z",
-      level: "info",
-      kind: "coordinator",
-      title: "Portfolio round 3 synthesized",
-      note: "Two duplicate directions were merged. Each active branch received a distinct next transition.",
-      problemId: "union-closed",
-    },
-    {
-      id: "evt-3",
-      at: "2026-07-23T14:54:00.000Z",
-      level: "diagnostic",
-      kind: "model",
-      title: "Solver turn completed",
-      note: "Max returned a schema-valid research delta in 18m 42s.",
-      problemId: "lonely-runner",
-      branchId: "torus-cover",
-    },
-    {
-      id: "evt-2",
-      at: "2026-07-23T14:40:00.000Z",
-      level: "info",
-      kind: "catalog",
-      title: "Open status rechecked",
-      note: "Five queued problem packets were independently re-vetted against current sources.",
-    },
-  ],
   manualQueue: [],
   operatorCommands: [],
 };
@@ -558,6 +224,49 @@ const RESUMABLE_CAMPAIGN_STATES = new Set([
   "catalog-exhausted",
 ]);
 
+const LIVE_PROBLEM_STATES = new Set([
+  "active",
+  "running",
+  "verifying",
+  "planning",
+  "starting",
+]);
+
+const ACTIVE_VERIFICATION_STATES = new Set([
+  "checking",
+  "running",
+  "pending",
+  "verifying",
+]);
+
+const SOLVED_VERIFICATION_STATES = new Set([
+  "agent-reproduced-candidate",
+  "reproduced",
+  "verified",
+]);
+
+const PROBLEM_STATE_LABELS: Record<ProblemState, string> = {
+  working: "Working",
+  verifying: "Verifying",
+  candidate: "Candidate",
+  solved: "Solved",
+  "no-solution": "No solution yet",
+  failed: "Failed",
+  paused: "Paused",
+  waiting: "Waiting",
+};
+
+const PROBLEM_STATE_ORDER: Record<ProblemState, number> = {
+  verifying: 0,
+  candidate: 1,
+  working: 2,
+  solved: 3,
+  paused: 4,
+  "no-solution": 5,
+  failed: 6,
+  waiting: 7,
+};
+
 function normalizeDashboard(input: unknown): DashboardData {
   if (!input || typeof input !== "object") {
     throw new Error("Dashboard response is not an object");
@@ -566,11 +275,11 @@ function normalizeDashboard(input: unknown): DashboardData {
     server?: DashboardServer;
     campaign?: Campaign | null;
     counts?: Partial<DashboardCounts>;
-    activeProblems?: ActiveProblem[];
-    completedProblems?: ActiveProblem[];
+    catalog?: CatalogProblem[] | { items?: CatalogProblem[] };
+    activeProblems?: ResearchProblem[];
+    completedProblems?: ResearchProblem[];
     events?: ResearchEvent[];
     notes?: ResearchEvent[];
-    catalog?: CatalogProblem[] | { items?: CatalogProblem[] };
     manualQueue?: ManualPacket[];
     operatorCommands?: OperatorCommand[];
   };
@@ -579,17 +288,12 @@ function normalizeDashboard(input: unknown): DashboardData {
     : Array.isArray(raw.catalog?.items)
       ? raw.catalog.items
       : [];
-  const liveProblems = Array.isArray(raw.activeProblems)
+  const activeProblems = Array.isArray(raw.activeProblems)
     ? raw.activeProblems
     : [];
   const completedProblems = Array.isArray(raw.completedProblems)
     ? raw.completedProblems
     : [];
-  const liveProblemIds = new Set(liveProblems.map((problem) => problem.id));
-  const activeProblems = [
-    ...liveProblems,
-    ...completedProblems.filter((problem) => !liveProblemIds.has(problem.id)),
-  ];
   const researchEvents = Array.isArray(raw.events)
     ? raw.events
     : Array.isArray(raw.notes)
@@ -617,37 +321,33 @@ function normalizeDashboard(input: unknown): DashboardData {
       title: frontendDiagnostic
         ? "Dashboard diagnostic"
         : note.level === "error"
-          ? "Controller process error"
+          ? "Controller error"
           : note.level === "warning"
-            ? "Controller process warning"
-            : "Controller process update",
+            ? "Controller warning"
+            : "Controller update",
       note: message,
     };
   });
-  const events = [...researchEvents, ...processEvents].sort((left, right) =>
-    right.at.localeCompare(left.at),
-  );
+  const events = [...researchEvents, ...processEvents]
+    .filter((event) => event.level !== "diagnostic")
+    .sort((left, right) => right.at.localeCompare(left.at));
   const derivedCounts: DashboardCounts = {
     catalog: catalog.length,
     queued: catalog.filter((problem) =>
       ["queued", "vetted", "ready"].includes(problem.state),
     ).length,
     active: activeProblems.filter((problem) =>
-      ["active", "running", "verifying"].includes(problem.status),
+      LIVE_PROBLEM_STATES.has(problem.status),
     ).length,
     candidates: activeProblems.reduce(
-      (total, problem) =>
-        total +
-        (problem.verification ?? problem.verificationRuns ?? []).length,
+      (sum, problem) => sum + verificationRuns(problem).length,
       0,
     ),
     reproduced: activeProblems.reduce(
-      (total, problem) =>
-        total +
-        (problem.verification ?? problem.verificationRuns ?? []).filter(
-          (run) =>
-            run.status === "agent-reproduced-candidate" ||
-            run.status === "reproduced",
+      (sum, problem) =>
+        sum +
+        verificationRuns(problem).filter((run) =>
+          SOLVED_VERIFICATION_STATES.has(run.status),
         ).length,
       0,
     ),
@@ -658,6 +358,7 @@ function normalizeDashboard(input: unknown): DashboardData {
     counts: { ...derivedCounts, ...(raw.counts ?? {}) },
     catalog,
     activeProblems,
+    completedProblems,
     events,
     manualQueue: Array.isArray(raw.manualQueue) ? raw.manualQueue : [],
     operatorCommands: Array.isArray(raw.operatorCommands)
@@ -666,159 +367,8 @@ function normalizeDashboard(input: unknown): DashboardData {
   };
 }
 
-function scoreStyle(value: number, max: number): CSSProperties {
-  return { width: `${Math.max(0, Math.min(100, (value / max) * 100))}%` };
-}
-
-function statusTone(status: string) {
-  const normalized = status.toLowerCase();
-  if (
-    normalized.includes("reproduced") ||
-    normalized.includes("passed") ||
-    normalized === "candidate"
-  ) {
-    return "success";
-  }
-  if (
-    normalized.includes("failed") ||
-    normalized.includes("error") ||
-    normalized.includes("rejected")
-  ) {
-    return "danger";
-  }
-  if (
-    normalized.includes("waiting") ||
-    normalized.includes("refram") ||
-    normalized.includes("cooldown") ||
-    normalized.includes("stopping")
-  ) {
-    return "warning";
-  }
-  if (
-    normalized.includes("active") ||
-    normalized.includes("running") ||
-    normalized.includes("verify") ||
-    normalized.includes("attack") ||
-    normalized.includes("discover")
-  ) {
-    return "active";
-  }
-  return "neutral";
-}
-
-function titleCase(value: string) {
-  return value
-    .replace(/[-_]/g, " ")
-    .replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-const FRIENDLY_STATUS: Record<string, string> = {
-  active: "Running",
-  attacking: "Running",
-  discovering: "Running",
-  planning: "Starting",
-  ranking: "Starting",
-  running: "Running",
-  starting: "Starting",
-  verifying: "Checking",
-  queued: "Waiting",
-  ready: "Waiting",
-  vetted: "Waiting",
-  cooldown: "Resting",
-  paused: "Paused",
-  stopped: "Paused",
-  stopping: "Pausing",
-  "deadline-reached": "Paused",
-  "budget-exhausted": "Paused",
-  candidate: "Candidate found",
-  "candidate-review": "Candidate review",
-  reproduced: "Verified",
-  retired: "Finished",
-  completed: "Finished",
-  "completed-no-result": "Finished",
-  "completed-with-candidate": "Candidate found",
-  interrupted: "Paused",
-  "progress-no-solution": "No final solution",
-  "no-result": "No final solution",
-  failed: "Attempt error",
-  saved: "Saved",
-};
-
-function friendlyStatus(status: string) {
-  return FRIENDLY_STATUS[status.toLowerCase()] ?? titleCase(status);
-}
-
-function attemptOutcome(attempt: CatalogAttempt) {
-  if (attempt.hasCandidate || attempt.candidateKind) return "Candidate found";
-  if (attempt.hasVerifiedPartial) return "Verified partial result";
-  const normalized = attempt.outcome.toLowerCase();
-  if (normalized === "progress-no-solution") {
-    return "No final solution · useful work saved";
-  }
-  if (normalized === "interrupted") return "Paused before completion";
-  if (normalized === "no-result") return "No final solution";
-  if (normalized.includes("failed") || normalized.includes("error")) {
-    return "Attempt error";
-  }
-  return friendlyStatus(attempt.outcome);
-}
-
-function problemStage(problem?: ActiveProblem) {
-  if (!problem) return "";
-  if (problem.status === "paused") return "Paused at a saved checkpoint";
-  const verification =
-    problem.verification ?? problem.verificationRuns ?? [];
-  if (verification.length) return "Checking a candidate";
-  if (!problem.branches.length) return "Planning approaches";
-  const moving = problem.branches.filter((branch) =>
-    ["running", "active", "verifying"].includes(branch.status),
-  ).length;
-  if (moving) {
-    return `Researching ${moving} approach${moving === 1 ? "" : "es"}`;
-  }
-  return problem.stage ? friendlyStatus(problem.stage) : "Attempt saved";
-}
-
-function problemStateLine(
-  problem: CatalogProblem,
-  activeProblem?: ActiveProblem,
-) {
-  if (activeProblem && ["active", "running", "verifying", "planning", "starting"].includes(activeProblem.status)) {
-    return problemStage(activeProblem);
-  }
-  const state = (problem.lifecycle ?? problem.state).toLowerCase();
-  if (state === "cooldown") {
-    const until = problem.cooldownUntil
-      ? ` until ${formatUtcTime(problem.cooldownUntil)}`
-      : "";
-    return `No final solution. Saved work is resting${until} before an automatic retry.`;
-  }
-  if (state === "paused") return "Paused at a saved checkpoint. Resume keeps this work.";
-  if (["queued", "ready", "vetted"].includes(state)) {
-    return "Waiting for an open problem slot.";
-  }
-  if (state === "retired") {
-    return "Finished after the allowed attempts; no verified solution.";
-  }
-  if (state.includes("candidate")) return "A candidate result is being checked.";
-  if (problem.lastOutcome) return `Last result: ${friendlyStatus(problem.lastOutcome)}.`;
-  return problem.selectionReason;
-}
-
-function inactiveProblemHeading(problem: CatalogProblem) {
-  const state = (problem.lifecycle ?? problem.state).toLowerCase();
-  if (state === "cooldown") return "No final solution yet";
-  if (state === "paused") return "Paused at a saved checkpoint";
-  if (state === "retired") return "Finished without a verified solution";
-  if (state.includes("candidate")) return "Candidate result under review";
-  return "Waiting for a problem slot";
-}
-
-function prioritizeLabel(problem: CatalogProblem) {
-  if (problem.operatorPinned) return "Scheduled next";
-  return (problem.lifecycle ?? problem.state) === "cooldown"
-    ? "Try again now"
-    : "Run next";
+function verificationRuns(problem?: ResearchProblem) {
+  return problem?.verification ?? problem?.verificationRuns ?? [];
 }
 
 function formatDuration(milliseconds: number) {
@@ -835,110 +385,400 @@ function formatUtcTime(iso: string) {
   return `${date.toISOString().slice(11, 16)} UTC`;
 }
 
+function titleCase(value: string) {
+  return value
+    .replace(/[-_]/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
 function campaignIsActive(campaign: Campaign | null) {
   return campaign ? ACTIVE_CAMPAIGN_STATES.has(campaign.status) : false;
 }
 
-function ScoreMeter({
-  label,
-  value,
-  max,
-  priority = false,
-}: {
-  label: string;
-  value: number;
-  max: number;
-  priority?: boolean;
-}) {
-  const display = priority ? Math.round(value) : value.toFixed(1);
+function classifyProblem(
+  catalog: CatalogProblem,
+  live?: ResearchProblem,
+  saved?: ResearchProblem,
+): ProblemState {
+  const allVerification = [
+    ...verificationRuns(live),
+    ...verificationRuns(saved),
+  ];
+  if (
+    allVerification.some((run) =>
+      SOLVED_VERIFICATION_STATES.has(run.status),
+    ) ||
+    catalog.attemptHistory?.some(
+      (attempt) =>
+        attempt.hasCandidate &&
+        /reproduced|verified/i.test(attempt.candidateKind ?? ""),
+    )
+  ) {
+    return "solved";
+  }
+  if (
+    live &&
+    (live.status === "verifying" ||
+      verificationRuns(live).some((run) =>
+        ACTIVE_VERIFICATION_STATES.has(run.status),
+      ))
+  ) {
+    return "verifying";
+  }
+  const lifecycle = (catalog.lifecycle ?? catalog.state).toLowerCase();
+  if (
+    lifecycle.includes("candidate") ||
+    catalog.attemptHistory?.at(-1)?.hasCandidate
+  ) {
+    return "candidate";
+  }
+  if (live && LIVE_PROBLEM_STATES.has(live.status)) return "working";
+  if (
+    ["paused", "stopped", "deadline-reached", "budget-exhausted"].includes(
+      lifecycle,
+    )
+  ) {
+    return "paused";
+  }
+  if (
+    lifecycle === "quarantined" ||
+    catalog.lastOutcome === "failed" ||
+    catalog.attemptHistory?.at(-1)?.outcome === "failed"
+  ) {
+    return "failed";
+  }
+  if (
+    ["cooldown", "retired"].includes(lifecycle) ||
+    ["progress-no-solution", "no-result"].includes(
+      catalog.lastOutcome ?? "",
+    )
+  ) {
+    return "no-solution";
+  }
+  return "waiting";
+}
+
+function problemHeadline(view: ProblemView) {
+  const { live, state } = view;
+  if (state === "verifying") return "Checking a candidate now";
+  if (state === "candidate") return "Candidate found; not verified yet";
+  if (state === "solved") return "Independently verified result";
+  if (state === "working") {
+    const count = live?.branches.length ?? 0;
+    return count
+      ? `${count} approach${count === 1 ? "" : "es"} in progress`
+      : "Preparing research approaches";
+  }
+  if (state === "paused") return "Saved at a checkpoint";
+  if (state === "failed") return "Attempt ended with an error";
+  if (state === "no-solution") return "Attempt ended without a final solution";
+  return "Waiting to be picked up";
+}
+
+function attemptOutcome(attempt: CatalogAttempt) {
+  if (attempt.hasCandidate || attempt.candidateKind) return "Candidate found";
+  if (attempt.hasVerifiedPartial) return "Verified partial result";
+  if (attempt.outcome === "progress-no-solution") return "No final solution";
+  if (attempt.outcome === "interrupted") return "Paused before completion";
+  if (attempt.outcome === "failed") return "Failed";
+  return titleCase(attempt.outcome);
+}
+
+function verificationLabel(status: string) {
+  if (SOLVED_VERIFICATION_STATES.has(status)) return "Verified";
+  if (ACTIVE_VERIFICATION_STATES.has(status)) return "In progress";
+  if (status === "inconclusive-budget-ended") return "Stopped at budget";
+  if (/reject|fail|refut/i.test(status)) return "Rejected";
+  if (/expert/i.test(status)) return "Needs expert review";
+  return titleCase(status);
+}
+
+function verificationSummary(view: ProblemView) {
+  const runs = [
+    ...verificationRuns(view.live),
+    ...verificationRuns(view.saved),
+  ];
+  if (!runs.length) return "";
+  if (
+    runs.some((run) => ACTIVE_VERIFICATION_STATES.has(run.status))
+  ) {
+    return "Verification is running now.";
+  }
+  if (
+    runs.some((run) => SOLVED_VERIFICATION_STATES.has(run.status))
+  ) {
+    return "Verification succeeded independently.";
+  }
+  const stopped = runs.find(
+    (run) => run.status === "inconclusive-budget-ended",
+  );
+  if (stopped) {
+    const passed = stopped.passes.filter(
+      (pass) => pass.verdict === "pass",
+    ).length;
+    return `Verification stopped at the budget · ${passed} check${passed === 1 ? "" : "s"} passed · not accepted as a solution.`;
+  }
+  if (runs.some((run) => /reject|fail|refut/i.test(run.status))) {
+    return "Verification rejected the candidate.";
+  }
+  return "A saved candidate has an unfinished verification record.";
+}
+
+function latestProgress(view: ProblemView) {
+  const liveSummary = view.live?.branches
+    .map((branch) => branch.latestSummary)
+    .find(Boolean);
+  if (liveSummary) return liveSummary;
+  const savedVerification = verificationSummary(view);
+  if (savedVerification) return savedVerification;
   return (
-    <div className={`scoreMeter ${priority ? "scoreMeterPriority" : ""}`}>
-      <div className="scoreLabel">
-        <span>{label}</span>
-        <strong>
-          {display}
-          <span className="scoreMax">/{max}</span>
-        </strong>
-      </div>
-      <div
-        className="scoreTrack"
-        role="progressbar"
-        aria-label={`${label}: ${display} out of ${max}`}
-        aria-valuemin={0}
-        aria-valuemax={max}
-        aria-valuenow={value}
-      >
-        <span className="scoreFill" style={scoreStyle(value, max)} />
-      </div>
-    </div>
+    view.catalog.attemptHistory?.at(-1)?.note ??
+    view.catalog.selectionReason
   );
 }
 
-function StatusChip({ status }: { status: string }) {
+function totalWork(view: ProblemView) {
   return (
-    <span className={`statusChip status-${statusTone(status)}`}>
-      <span className="statusDot" aria-hidden="true" />
-      {friendlyStatus(status)}
-    </span>
+    (view.catalog.totalActiveWorkMs ?? 0) +
+    (view.live?.activeWorkMs ?? 0)
   );
 }
 
-function KpiCard({
-  label,
-  value,
-  detail,
-  accent,
-}: {
-  label: string;
-  value: string | number;
-  detail: string;
-  accent: string;
-}) {
+function totalCalls(view: ProblemView) {
   return (
-    <article className="kpiCard" style={{ "--kpi-accent": accent } as CSSProperties}>
-      <span className="kpiLabel">{label}</span>
-      <strong className="kpiValue">{value}</strong>
-      <span className="kpiDetail">{detail}</span>
-    </article>
+    (view.catalog.totalCalls ?? 0) +
+    (view.live?.callsStarted ?? 0)
   );
 }
 
-function AttemptHistory({
-  attempts,
-  preserved = false,
-}: {
-  attempts: CatalogAttempt[];
-  preserved?: boolean;
-}) {
-  if (!attempts.length) return null;
+function attemptCount(view: ProblemView) {
   return (
-    <section
-      className={`attemptHistory ${preserved ? "attemptHistoryPreserved" : ""}`}
-    >
-      <p className="sectionKicker">
-        {preserved ? "Earlier work is preserved" : "Saved attempt history"}
-      </p>
-      {preserved && (
-        <p className="historyExplanation">
-          The current run is continuing alongside these saved notes, facts, and
-          failed paths.
-        </p>
-      )}
-      <ol>
-        {attempts.map((attempt, index) => (
-          <li key={attempt.attemptId}>
-            <strong>
-              Attempt {index + 1} · {attemptOutcome(attempt)}
-            </strong>
-            <span>
-              {formatDuration(attempt.activeWorkMs)} worked ·{" "}
-              {attempt.callsStarted} calls · {attempt.rounds} rounds
+    (view.catalog.attemptHistory?.length ?? 0) +
+    (view.live ? 1 : 0)
+  );
+}
+
+function ProblemCard({
+  view,
+  commandsAvailable,
+  commandPending,
+  onPrioritize,
+  onSwitch,
+}: {
+  view: ProblemView;
+  commandsAvailable: boolean;
+  commandPending: string | null;
+  onPrioritize: (problem: CatalogProblem) => void;
+  onSwitch: (problem: ResearchProblem) => void;
+}) {
+  const { catalog, live, saved, state } = view;
+  const runs = [...verificationRuns(live), ...verificationRuns(saved)];
+  const savedBranches = saved?.branches ?? [];
+  const verificationLine = verificationSummary(view);
+  return (
+    <details className={`problemCard problem-${state}`}>
+      <summary>
+        <span className={`problemStatus problemStatus-${state}`}>
+          {PROBLEM_STATE_LABELS[state]}
+        </span>
+        <span className="problemSummary">
+          <span className="problemTitleRow">
+            <strong>{catalog.title}</strong>
+            <small>{catalog.domain}</small>
+          </span>
+          <span className="problemHeadline">{problemHeadline(view)}</span>
+          {verificationLine && (
+            <span className="verificationHeadline">{verificationLine}</span>
+          )}
+          <span className="problemMeta">
+            {formatDuration(totalWork(view))} · {totalCalls(view)} calls ·{" "}
+            {attemptCount(view)} attempt
+            {attemptCount(view) === 1 ? "" : "s"}
+          </span>
+        </span>
+        <span className="expandLabel" aria-hidden="true">
+          Details
+        </span>
+      </summary>
+
+      <div className="problemDetails">
+        <section className="detailBlock currentStateBlock">
+          <div className="detailHeading">
+            <h3>Current state</h3>
+            <span className={`problemStatus problemStatus-${state}`}>
+              {PROBLEM_STATE_LABELS[state]}
             </span>
-            {attempt.note && <small>{attempt.note}</small>}
-          </li>
-        ))}
-      </ol>
-    </section>
+          </div>
+          <p className="stateHeadline">{problemHeadline(view)}</p>
+          <p>{latestProgress(view)}</p>
+        </section>
+
+        {live && (
+          <section className="detailBlock">
+            <div className="detailHeading">
+              <h3>Approaches running now</h3>
+              <span>{live.branches.length}</span>
+            </div>
+            {live.branches.length ? (
+              <ul className="approachList">
+                {live.branches.map((branch) => (
+                  <li key={branch.id}>
+                    <div>
+                      <strong>{branch.title}</strong>
+                      <span>{titleCase(branch.status)}</span>
+                    </div>
+                    <p>
+                      {branch.latestSummary ||
+                        "Waiting for the first research update."}
+                    </p>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p>Planning distinct approaches now.</p>
+            )}
+          </section>
+        )}
+
+        {runs.length > 0 && (
+          <section className="detailBlock verificationBlock">
+            <div className="detailHeading">
+              <h3>Verification</h3>
+              <span>{runs.length}</span>
+            </div>
+            <div className="verificationList">
+              {runs.map((run) => (
+                <article key={run.candidateHash}>
+                  <div className="verificationTitle">
+                    <strong>{verificationLabel(run.status)}</strong>
+                    <code>{run.candidateHash.slice(0, 8)}</code>
+                  </div>
+                  <p>{run.candidateClaim || "Saved candidate claim"}</p>
+                  {run.status === "inconclusive-budget-ended" && (
+                    <p className="verificationWarning">
+                      This did not solve the problem. A partial claim passed one
+                      check, but verification stopped before completion.
+                    </p>
+                  )}
+                  {run.passes.length > 0 && (
+                    <ol>
+                      {run.passes.map((pass) => (
+                        <li key={pass.pass}>
+                          <strong>
+                            Check {pass.pass}: {titleCase(pass.verdict)}
+                          </strong>
+                          <span>{pass.note}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  )}
+                </article>
+              ))}
+            </div>
+          </section>
+        )}
+
+        {(catalog.attemptHistory?.length ?? 0) > 0 && (
+          <section className="detailBlock">
+            <div className="detailHeading">
+              <h3>Attempt history</h3>
+              <span>{catalog.attemptHistory?.length}</span>
+            </div>
+            <ol className="attemptList">
+              {catalog.attemptHistory?.map((attempt, index) => (
+                <li key={attempt.attemptId}>
+                  <div>
+                    <strong>
+                      Attempt {index + 1}: {attemptOutcome(attempt)}
+                    </strong>
+                    <span>
+                      {formatDuration(attempt.activeWorkMs)} ·{" "}
+                      {attempt.callsStarted} calls
+                    </span>
+                  </div>
+                  {attempt.note && <p>{attempt.note}</p>}
+                </li>
+              ))}
+            </ol>
+          </section>
+        )}
+
+        {!live && savedBranches.length > 0 && (
+          <section className="detailBlock">
+            <div className="detailHeading">
+              <h3>Approaches saved from the last attempt</h3>
+              <span>{savedBranches.length}</span>
+            </div>
+            <ul className="approachList">
+              {savedBranches.map((branch) => (
+                <li key={branch.id}>
+                  <div>
+                    <strong>{branch.title}</strong>
+                    <span>Saved</span>
+                  </div>
+                  <p>{branch.latestSummary || "No final branch note."}</p>
+                </li>
+              ))}
+            </ul>
+          </section>
+        )}
+
+        {(live?.statement || saved?.statement) && (
+          <details className="statementDetails">
+            <summary>Problem statement and sources</summary>
+            <p>{live?.statement ?? saved?.statement}</p>
+            {(live?.sourceUrls ?? saved?.sourceUrls ?? []).length > 0 && (
+              <ul>
+                {(live?.sourceUrls ?? saved?.sourceUrls ?? []).map((url) => (
+                  <li key={url}>
+                    <a href={url} target="_blank" rel="noreferrer">
+                      {url}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </details>
+        )}
+
+        <div className="problemActions">
+          {live && (
+            <button
+              type="button"
+              className="textButton dangerText"
+              disabled={
+                !commandsAvailable ||
+                commandPending !== null ||
+                Boolean(live.switchRequestedAt)
+              }
+              onClick={() => onSwitch(live)}
+            >
+              {live.switchRequestedAt
+                ? "Switch requested"
+                : "Stop this attempt and pick another"}
+            </button>
+          )}
+          {!live && ["no-solution", "waiting", "failed"].includes(state) && (
+            <button
+              type="button"
+              className="button buttonSecondary"
+              disabled={
+                !commandsAvailable ||
+                commandPending !== null ||
+                catalog.operatorPinned
+              }
+              onClick={() => onPrioritize(catalog)}
+            >
+              {catalog.operatorPinned
+                ? "Scheduled next"
+                : state === "no-solution"
+                  ? "Try this problem again"
+                  : "Run this problem next"}
+            </button>
+          )}
+        </div>
+      </div>
+    </details>
   );
 }
 
@@ -946,8 +786,7 @@ export default function AutoproverDashboard() {
   const [data, setData] = useState<DashboardData>(EMPTY_DATA);
   const [connection, setConnection] =
     useState<ConnectionState>("connecting");
-  const [lastSync, setLastSync] = useState("Waiting for controller");
-  const [selectedId, setSelectedId] = useState("");
+  const [lastSync, setLastSync] = useState("Connecting");
   const [settings, setSettings] = useState<CampaignSettings>({
     provider: "max",
     hours: 24,
@@ -956,26 +795,14 @@ export default function AutoproverDashboard() {
   });
   const [commandPending, setCommandPending] = useState<string | null>(null);
   const [feedback, setFeedback] = useState("");
-  const [showDiagnostics, setShowDiagnostics] = useState(false);
-  const [manualResponse, setManualResponse] = useState("");
   const [problemSuggestion, setProblemSuggestion] = useState("");
+  const [manualResponse, setManualResponse] = useState("");
   const hasLiveData = useRef(false);
   const hydratedCampaignId = useRef("");
 
   useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      const savedProblem = window.localStorage.getItem(
-        "autoprover:selected-problem",
-      );
-      if (savedProblem) setSelectedId(savedProblem);
-    }, 0);
-    return () => window.clearTimeout(timeout);
-  }, []);
-
-  useEffect(() => {
     let cancelled = false;
     let timeout: ReturnType<typeof setTimeout> | undefined;
-
     const poll = async () => {
       try {
         const response = await fetch("/api/dashboard", {
@@ -990,27 +817,31 @@ export default function AutoproverDashboard() {
         hasLiveData.current = true;
         setData(next);
         setConnection("live");
-        setLastSync(`${formatUtcTime(new Date().toISOString())}`);
+        setLastSync(formatUtcTime(new Date().toISOString()));
+        if (
+          next.campaign &&
+          hydratedCampaignId.current !== next.campaign.id
+        ) {
+          hydratedCampaignId.current = next.campaign.id;
+          setSettings((current) => ({
+            ...current,
+            provider: next.campaign?.provider ?? current.provider,
+            parallelProblems:
+              next.campaign?.parallelProblems ?? current.parallelProblems,
+            maxCalls: next.campaign?.budget.maxCalls ?? current.maxCalls,
+          }));
+        }
       } catch {
         if (cancelled) return;
         setConnection("offline");
-        const demoRequested =
-          new URLSearchParams(window.location.search).get("demo") === "1";
-        if (!hasLiveData.current) {
-          setData(demoRequested ? DEMO_DATA : EMPTY_DATA);
-        }
+        if (!hasLiveData.current) setData(EMPTY_DATA);
         setLastSync(
-          hasLiveData.current
-            ? "Connection lost · showing last update"
-            : demoRequested
-              ? "Demo snapshot"
-              : "Controller unavailable",
+          hasLiveData.current ? "Showing last update" : "Controller unavailable",
         );
       } finally {
         if (!cancelled) timeout = setTimeout(poll, 2_000);
       }
     };
-
     void poll();
     return () => {
       cancelled = true;
@@ -1018,65 +849,16 @@ export default function AutoproverDashboard() {
     };
   }, []);
 
-  useEffect(() => {
-    if (
-      connection !== "live" ||
-      !data.campaign ||
-      hydratedCampaignId.current === data.campaign.id
-    ) {
-      return;
-    }
-    hydratedCampaignId.current = data.campaign.id;
-    setSettings((current) => ({
-      ...current,
-      provider: data.campaign?.provider ?? current.provider,
-      parallelProblems:
-        data.campaign?.parallelProblems ?? current.parallelProblems,
-      maxCalls: data.campaign?.budget.maxCalls ?? current.maxCalls,
-    }));
-  }, [connection, data.campaign]);
-
-  const allProblemIds = new Set([
-    ...data.catalog.map((problem) => problem.id),
-    ...data.activeProblems.map((problem) => problem.id),
-  ]);
-  const effectiveSelectedId = allProblemIds.has(selectedId)
-    ? selectedId
-    : (data.activeProblems[0]?.id ?? data.catalog[0]?.id ?? "");
-  const catalogProblem = data.catalog.find(
-    (problem) => problem.id === effectiveSelectedId,
-  );
-  const activeProblem = data.activeProblems.find(
-    (problem) => problem.id === effectiveSelectedId,
-  );
-  const selectedProblemIsRunning = Boolean(
-    activeProblem &&
-      ["active", "running", "verifying", "planning", "starting"].includes(
-        activeProblem.status,
-      ),
-  );
-  const selectedProblemStage = selectedProblemIsRunning
-    ? problemStage(activeProblem)
-    : catalogProblem
-      ? inactiveProblemHeading(catalogProblem)
-      : activeProblem
-        ? "Saved attempt report"
-        : "Waiting";
-  const verificationRuns =
-    activeProblem?.verification ?? activeProblem?.verificationRuns ?? [];
-  const visibleEvents = data.events.filter(
-    (event) => showDiagnostics || event.level !== "diagnostic",
-  );
   const isActive = campaignIsActive(data.campaign);
   const isStopping = data.campaign?.status === "stopping";
   const canResume = Boolean(
     data.campaign && RESUMABLE_CAMPAIGN_STATES.has(data.campaign.status),
   );
-  const configuredProblemSlots =
-    data.campaign?.problemSlots?.configured ??
-    data.campaign?.parallelProblems ??
-    settings.parallelProblems;
-  const runningProblems = data.counts.active;
+  const commandToken = data.server.commandToken;
+  const commandsAvailable =
+    connection === "live" &&
+    typeof commandToken === "string" &&
+    commandToken.length > 0;
   const inFlightCalls =
     data.campaign?.budget.inFlight ??
     Math.max(
@@ -1086,49 +868,63 @@ export default function AutoproverDashboard() {
         (data.campaign?.budget.callsFailed ?? 0),
     );
   const maxConcurrentCalls = data.campaign?.maxConcurrentCalls ?? 4;
-  const callsRemaining = data.campaign
-    ? Math.max(
-        0,
-        data.campaign.budget.maxCalls - data.campaign.budget.callsStarted,
-      )
-    : settings.maxCalls;
-  const resumedCallAllowance = data.campaign
-    ? Math.max(
-        0,
-        settings.maxCalls - data.campaign.budget.callsStarted,
-      )
-    : settings.maxCalls;
-  const restingProblems =
-    data.counts.cooldown ??
-    data.catalog.filter((problem) => problem.state === "cooldown").length;
   const callPercent = data.campaign?.budget.maxCalls
     ? Math.min(
         100,
-        (data.campaign.budget.callsStarted / data.campaign.budget.maxCalls) *
+        (data.campaign.budget.callsStarted /
+          data.campaign.budget.maxCalls) *
           100,
       )
     : 0;
+  const resumedCallAllowance = data.campaign
+    ? Math.max(0, settings.maxCalls - data.campaign.budget.callsStarted)
+    : settings.maxCalls;
   const firstManualPacket = data.manualQueue[0];
-  const commandToken = data.server.commandToken;
-  const commandsAvailable =
-    connection === "live" && typeof commandToken === "string" && commandToken.length > 0;
-  const nudgeCommandsInFlight = data.operatorCommands.filter((command) =>
-    ["pending", "running"].includes(command.status),
-  ).length;
-
-  function selectProblem(problemId: string) {
-    setSelectedId(problemId);
-    window.localStorage.setItem("autoprover:selected-problem", problemId);
-  }
+  const problemViews: ProblemView[] = data.catalog
+    .map((catalog) => {
+      const live = data.activeProblems.find(
+        (problem) => problem.id === catalog.id,
+      );
+      const saved = data.completedProblems.find(
+        (problem) => problem.id === catalog.id,
+      );
+      return {
+        catalog,
+        live,
+        saved,
+        state: classifyProblem(catalog, live, saved),
+      };
+    })
+    .sort(
+      (left, right) =>
+        PROBLEM_STATE_ORDER[left.state] -
+          PROBLEM_STATE_ORDER[right.state] ||
+        left.catalog.rank - right.catalog.rank,
+    );
+  const stateCounts = problemViews.reduce(
+    (counts, view) => {
+      counts[view.state] += 1;
+      return counts;
+    },
+    {
+      working: 0,
+      verifying: 0,
+      candidate: 0,
+      solved: 0,
+      "no-solution": 0,
+      failed: 0,
+      paused: 0,
+      waiting: 0,
+    } satisfies Record<ProblemState, number>,
+  );
+  const workingNow = stateCounts.working + stateCounts.verifying;
 
   async function sendCommand(
     action: "start" | "stop" | "resume",
     payload: Record<string, unknown>,
   ) {
     if (!commandsAvailable || !commandToken) {
-      setFeedback(
-        "Controls are disabled until the authorized local campaign controller is connected.",
-      );
+      setFeedback("The local controller is not connected.");
       return;
     }
     setCommandPending(action);
@@ -1153,20 +949,16 @@ export default function AutoproverDashboard() {
         );
       }
       setFeedback(
-        result.message ||
-          (action === "start"
-            ? "Campaign is starting."
-            : action === "stop"
-              ? "Safe stop requested. Active work is being checkpointed."
-              : `Campaign extended by ${settings.hours} hours.`),
+        result.message ??
+          (action === "stop"
+            ? "Finishing current calls and saving checkpoints."
+            : action === "resume"
+              ? "Resuming saved work."
+              : "Campaign is starting."),
       );
     } catch (error) {
       setFeedback(
-        connection === "offline"
-          ? "The local campaign controller is offline. This page is showing clearly labeled demo data."
-          : error instanceof Error
-            ? error.message
-            : "The command could not be completed.",
+        error instanceof Error ? error.message : "The command failed.",
       );
     } finally {
       setCommandPending(null);
@@ -1179,9 +971,7 @@ export default function AutoproverDashboard() {
     payload: Record<string, unknown> = {},
   ) {
     if (!commandsAvailable || !commandToken) {
-      setFeedback(
-        "Nudges require the authorized local campaign controller.",
-      );
+      setFeedback("The local controller is not connected.");
       return false;
     }
     setCommandPending(action);
@@ -1205,46 +995,16 @@ export default function AutoproverDashboard() {
           result.error || result.message || `Command failed (${response.status})`,
         );
       }
-      setFeedback(result.message ?? "Nudge saved.");
+      setFeedback(result.message ?? "Saved.");
       return true;
     } catch (error) {
       setFeedback(
-        error instanceof Error ? error.message : "The nudge could not be saved.",
+        error instanceof Error ? error.message : "The action failed.",
       );
       return false;
     } finally {
       setCommandPending(null);
     }
-  }
-
-  function requestMoreProblems() {
-    void sendNudge("discover", "/api/catalog/discover");
-  }
-
-  async function suggestProblem(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const query = problemSuggestion.trim();
-    if (!query) return;
-    const accepted = await sendNudge("suggest", "/api/catalog/suggest", {
-      query,
-    });
-    if (accepted) setProblemSuggestion("");
-  }
-
-  function prioritizeSelectedProblem() {
-    if (!catalogProblem) return;
-    void sendNudge("prioritize", "/api/catalog/prioritize", {
-      problemKey: catalogProblem.id,
-    });
-  }
-
-  function switchSelectedProblem() {
-    if (!activeProblem?.attemptId) return;
-    void sendNudge("switch", "/api/attempt/switch", {
-      attemptId: activeProblem.attemptId,
-      problemKey: activeProblem.id,
-      reason: "Operator switched away from a stalled or lower-priority attack",
-    });
   }
 
   function startCampaign(event: FormEvent<HTMLFormElement>) {
@@ -1258,24 +1018,43 @@ export default function AutoproverDashboard() {
     });
   }
 
+  async function suggestProblem(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const query = problemSuggestion.trim();
+    if (!query) return;
+    const accepted = await sendNudge("suggest", "/api/catalog/suggest", {
+      query,
+    });
+    if (accepted) setProblemSuggestion("");
+  }
+
+  function prioritizeProblem(problem: CatalogProblem) {
+    void sendNudge("prioritize", "/api/catalog/prioritize", {
+      problemKey: problem.id,
+    });
+  }
+
+  function switchProblem(problem: ResearchProblem) {
+    if (!problem.attemptId) return;
+    void sendNudge("switch", "/api/attempt/switch", {
+      attemptId: problem.attemptId,
+      problemKey: problem.id,
+      reason: "Operator chose to stop this attempt and work on another problem",
+    });
+  }
+
   async function copyManualPrompt() {
     if (!firstManualPacket?.prompt) return;
     try {
       await navigator.clipboard.writeText(firstManualPacket.prompt);
-      setFeedback("Manual Pro prompt copied.");
+      setFeedback("Manual prompt copied.");
     } catch {
-      setFeedback("Could not access the clipboard. Select and copy the prompt below.");
+      setFeedback("Could not copy automatically.");
     }
   }
 
   async function submitManualResponse() {
-    if (!firstManualPacket) return;
-    if (!commandsAvailable || !commandToken) {
-      setFeedback(
-        "Controls are disabled until the authorized local campaign controller is connected.",
-      );
-      return;
-    }
+    if (!firstManualPacket || !commandsAvailable || !commandToken) return;
     setCommandPending("manual");
     setFeedback("");
     try {
@@ -1300,14 +1079,14 @@ export default function AutoproverDashboard() {
         throw new Error(result.error || result.message || "Import failed");
       }
       setManualResponse("");
-      setFeedback("Manual response validated and queued. The campaign will resume.");
+      setFeedback("Response accepted. Work will continue.");
     } catch (error) {
       setFeedback(
         error instanceof SyntaxError
-          ? "The manual response is not valid JSON."
+          ? "The response is not valid JSON."
           : error instanceof Error
             ? error.message
-            : "The manual response could not be imported.",
+            : "The response could not be imported.",
       );
     } finally {
       setCommandPending(null);
@@ -1316,8 +1095,8 @@ export default function AutoproverDashboard() {
 
   return (
     <>
-      <a className="skipLink" href="#main-content">
-        Skip to campaign workspace
+      <a className="skipLink" href="#problems">
+        Skip to problems
       </a>
       <div className="dashboardShell">
         <header className="appHeader">
@@ -1326,170 +1105,63 @@ export default function AutoproverDashboard() {
               ∀
             </span>
             <div>
-              <p className="eyebrow">Continuous mathematical research</p>
               <h1>Autoprover</h1>
+              <p>Continuous mathematical research</p>
             </div>
           </div>
-          <div className="connectionBlock" role="status" aria-live="polite">
-            <span className={`connectionPill connection-${connection}`}>
-              <span aria-hidden="true" className="connectionDot" />
-              {connection === "live"
-                ? "Controller live"
-                : connection === "offline"
-                  ? "Demo · controller offline"
-                  : "Preview · connecting"}
-            </span>
-            <span className="syncLabel">{lastSync}</span>
+          <div className={`connection connection-${connection}`}>
+            <span aria-hidden="true" />
+            {connection === "live"
+              ? "Live"
+              : connection === "offline"
+                ? "Offline"
+                : "Connecting"}
+            <small>{lastSync}</small>
           </div>
         </header>
 
-        {connection !== "live" && (
-          <div className="offlineNotice" role="status">
-            <strong>
-              {connection === "offline" ? "Offline demo" : "Connecting"}
-            </strong>
-            <span>
-              {connection === "offline"
-                ? "The values below are illustrative and no agents are running from this page."
-                : "Showing an illustrative snapshot while the local controller responds."}
-            </span>
-          </div>
-        )}
-
-        <section className="campaignPanel" aria-labelledby="campaign-heading">
-          <div className="campaignSummary">
-            <div>
-              <p className="sectionKicker">Campaign control</p>
-              <div className="campaignHeadingRow">
-                <h2 id="campaign-heading">
-                  {data.campaign
-                    ? `Cycle ${data.campaign.cycle} · ${titleCase(data.campaign.phase)}`
-                    : "Ready to begin"}
-                </h2>
-                {data.campaign && <StatusChip status={data.campaign.status} />}
+        <section className="campaignBar" aria-label="Campaign status">
+          {data.campaign ? (
+            <>
+              <div className="campaignState">
+                <span
+                  className={`runDot ${isActive ? "runDotActive" : ""}`}
+                  aria-hidden="true"
+                />
+                <div>
+                  <strong>
+                    {isActive
+                      ? "Running"
+                      : canResume
+                        ? "Paused"
+                        : titleCase(data.campaign.status)}
+                  </strong>
+                  <span>
+                    {workingNow} problem{workingNow === 1 ? "" : "s"} working
+                  </span>
+                </div>
               </div>
-              <p className="campaignNote">
-                {data.campaign?.latestNote ??
-                  "The coordinator will keep the catalog fresh and fill open worker slots with high-priority problems."}
-              </p>
-            </div>
-            <div className="campaignClock">
-              <span>Time remaining</span>
-              <strong>
-                {data.campaign
-                  ? formatDuration(data.campaign.timeLeftMs)
-                  : `${settings.hours}h`}
-              </strong>
-              <small>
-                {data.campaign
-                  ? `Provider: ${PROVIDERS.find((item) => item.value === data.campaign?.provider)?.label ?? data.campaign.provider}`
-                  : "Continuous discovery on"}
-              </small>
-            </div>
-          </div>
-
-          <form className="campaignForm" onSubmit={startCampaign}>
-            <label>
-              <span>Provider</span>
-              <select
-                value={settings.provider}
-                disabled={Boolean(data.campaign)}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    provider: event.target.value,
-                  }))
-                }
-              >
-                {PROVIDERS.map((provider) => (
-                  <option key={provider.value} value={provider.value}>
-                    {provider.label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>{canResume ? "Add time" : "Run for"}</span>
-              <select
-                value={settings.hours}
-                disabled={isActive}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    hours: Number(event.target.value),
-                  }))
-                }
-              >
-                <option value={1}>1 hour · trial</option>
-                <option value={2}>2 hours · trial</option>
-                <option value={12}>12 hours</option>
-                <option value={24}>24 hours</option>
-              </select>
-            </label>
-            <label>
-              <span>Problem slots</span>
-              <input
-                type="number"
-                min={Math.max(
-                  1,
-                  data.campaign?.budget.callsStarted ?? 1,
-                )}
-                max={8}
-                inputMode="numeric"
-                value={settings.parallelProblems}
-                disabled={isActive}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    parallelProblems: Math.max(
-                      1,
-                      Math.min(8, Number(event.target.value) || 1),
-                    ),
-                  }))
-                }
-              />
-            </label>
-            <label>
-              <span>Total call cap</span>
-              <input
-                type="number"
-                min={1}
-                max={1000}
-                inputMode="numeric"
-                value={settings.maxCalls}
-                disabled={isActive}
-                onChange={(event) =>
-                  setSettings((current) => ({
-                    ...current,
-                    maxCalls: Math.max(
-                      data.campaign?.budget.callsStarted ?? 1,
-                      Number(event.target.value) || 1,
-                    ),
-                  }))
-                }
-              />
-            </label>
-            <div className="campaignActions" aria-label="Campaign actions">
-              {!data.campaign && (
-                <button
-                  className="button buttonPrimary"
-                  type="submit"
-                  disabled={!commandsAvailable || commandPending !== null}
-                  title={
-                    !commandsAvailable
-                      ? "Connect the authorized local controller to enable commands"
-                      : undefined
-                  }
-                >
-                  {commandPending === "start"
-                    ? "Starting…"
-                    : "Start campaign"}
-                </button>
-              )}
+              <div className="campaignMetric">
+                <strong>{formatDuration(data.campaign.timeLeftMs)}</strong>
+                <span>remaining</span>
+              </div>
+              <div className="campaignMetric">
+                <strong>
+                  {data.campaign.budget.callsStarted}/
+                  {data.campaign.budget.maxCalls}
+                </strong>
+                <span>calls</span>
+              </div>
+              <div className="campaignMetric campaignMetricSecondary">
+                <strong>
+                  {inFlightCalls}/{maxConcurrentCalls}
+                </strong>
+                <span>calls running</span>
+              </div>
               {isActive && (
                 <button
-                  className="button buttonDanger"
                   type="button"
+                  className="button buttonDanger"
                   disabled={
                     !commandsAvailable ||
                     isStopping ||
@@ -1500,14 +1172,14 @@ export default function AutoproverDashboard() {
                   }
                 >
                   {commandPending === "stop" || isStopping
-                    ? "Saving checkpoints…"
-                    : "Pause after current calls"}
+                    ? "Saving…"
+                    : "Pause"}
                 </button>
               )}
               {canResume && (
                 <button
-                  className="button buttonPrimary"
                   type="button"
+                  className="button buttonPrimary"
                   disabled={
                     !commandsAvailable ||
                     commandPending !== null ||
@@ -1523,753 +1195,328 @@ export default function AutoproverDashboard() {
                   }
                 >
                   {commandPending === "resume"
-                    ? "Resuming saved work…"
-                    : `Resume saved work for ${settings.hours}h`}
+                    ? "Resuming…"
+                    : `Resume for ${settings.hours}h`}
                 </button>
               )}
-            </div>
-          </form>
-          <p className="controlExplanation">
-            {!data.campaign
-              ? "Starts one continuous campaign. Every problem, approach, and note is saved."
-              : isActive
-                ? `${runningProblems} of ${configuredProblemSlots} problem slots running · ${inFlightCalls} of ${maxConcurrentCalls} model calls in use. Pausing waits for current calls and keeps every checkpoint.`
-                : canResume
-                  ? `Your catalog and attempt history are preserved. Resuming adds time; the call cap is cumulative and ${resumedCallAllowance || callsRemaining} calls remain${resumedCallAllowance === 0 ? "—raise the total call cap to continue research" : ""}.`
-                  : "This campaign is saved. Its final state is shown below."}
-          </p>
-          <div className="commandFeedback" aria-live="polite">
-            {feedback}
-          </div>
-          {data.campaign && (
-            <div className="callBudget">
-              <div>
-                <span>Call budget</span>
-                <strong>
-                  {data.campaign.budget.callsStarted}/
-                  {data.campaign.budget.maxCalls}
-                </strong>
-              </div>
-              <div
-                className="budgetTrack"
-                role="progressbar"
-                aria-label={`${data.campaign.budget.callsStarted} of ${data.campaign.budget.maxCalls} calls started`}
-                aria-valuemin={0}
-                aria-valuemax={data.campaign.budget.maxCalls}
-                aria-valuenow={data.campaign.budget.callsStarted}
-              >
+              <div className="callProgress" aria-hidden="true">
                 <span style={{ width: `${callPercent}%` }} />
               </div>
-              <small>
-                {data.campaign.budget.callsCompleted} completed ·{" "}
-                {data.campaign.budget.callsFailed} failed
-              </small>
-            </div>
+              {canResume && (
+                <details className="runSettings">
+                  <summary>Change resume limits</summary>
+                  <div>
+                    <label>
+                      <span>Add time</span>
+                      <select
+                        value={settings.hours}
+                        onChange={(event) =>
+                          setSettings((current) => ({
+                            ...current,
+                            hours: Number(event.target.value),
+                          }))
+                        }
+                      >
+                        <option value={1}>1 hour</option>
+                        <option value={2}>2 hours</option>
+                        <option value={12}>12 hours</option>
+                        <option value={24}>24 hours</option>
+                      </select>
+                    </label>
+                    <label>
+                      <span>Problem slots</span>
+                      <input
+                        type="number"
+                        min={1}
+                        max={8}
+                        value={settings.parallelProblems}
+                        onChange={(event) =>
+                          setSettings((current) => ({
+                            ...current,
+                            parallelProblems: Math.max(
+                              1,
+                              Math.min(8, Number(event.target.value) || 1),
+                            ),
+                          }))
+                        }
+                      />
+                    </label>
+                    <label>
+                      <span>Total call cap</span>
+                      <input
+                        type="number"
+                        min={data.campaign.budget.callsStarted}
+                        value={settings.maxCalls}
+                        onChange={(event) =>
+                          setSettings((current) => ({
+                            ...current,
+                            maxCalls: Math.max(
+                              data.campaign?.budget.callsStarted ?? 1,
+                              Number(event.target.value) || 1,
+                            ),
+                          }))
+                        }
+                      />
+                    </label>
+                  </div>
+                  {resumedCallAllowance === 0 && (
+                    <p>Raise the total call cap before resuming.</p>
+                  )}
+                </details>
+              )}
+            </>
+          ) : (
+            <form className="startRun" onSubmit={startCampaign}>
+              <div>
+                <strong>Ready to run</strong>
+                <span>Starts with the defaults below.</span>
+              </div>
+              <button
+                type="submit"
+                className="button buttonPrimary"
+                disabled={!commandsAvailable || commandPending !== null}
+              >
+                {commandPending === "start"
+                  ? "Starting…"
+                  : `Start ${settings.hours}h run`}
+              </button>
+              <details className="runSettings">
+                <summary>Change run settings</summary>
+                <div>
+                  <label>
+                    <span>Provider</span>
+                    <select
+                      value={settings.provider}
+                      onChange={(event) =>
+                        setSettings((current) => ({
+                          ...current,
+                          provider: event.target.value,
+                        }))
+                      }
+                    >
+                      {PROVIDERS.map((provider) => (
+                        <option key={provider.value} value={provider.value}>
+                          {provider.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label>
+                    <span>Hours</span>
+                    <select
+                      value={settings.hours}
+                      onChange={(event) =>
+                        setSettings((current) => ({
+                          ...current,
+                          hours: Number(event.target.value),
+                        }))
+                      }
+                    >
+                      <option value={1}>1</option>
+                      <option value={2}>2</option>
+                      <option value={12}>12</option>
+                      <option value={24}>24</option>
+                    </select>
+                  </label>
+                  <label>
+                    <span>Problem slots</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={8}
+                      value={settings.parallelProblems}
+                      onChange={(event) =>
+                        setSettings((current) => ({
+                          ...current,
+                          parallelProblems: Math.max(
+                            1,
+                            Math.min(8, Number(event.target.value) || 1),
+                          ),
+                        }))
+                      }
+                    />
+                  </label>
+                  <label>
+                    <span>Call cap</span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={settings.maxCalls}
+                      onChange={(event) =>
+                        setSettings((current) => ({
+                          ...current,
+                          maxCalls: Math.max(
+                            1,
+                            Number(event.target.value) || 1,
+                          ),
+                        }))
+                      }
+                    />
+                  </label>
+                </div>
+              </details>
+            </form>
+          )}
+          {feedback && (
+            <p className="commandFeedback" role="status">
+              {feedback}
+            </p>
           )}
         </section>
 
         {firstManualPacket && (
-          <section className="manualBanner" role="alert">
+          <section className="manualBanner">
             <div>
-              <p className="sectionKicker">Manual Pro input required</p>
-              <h2>A schema-validated response is waiting</h2>
-              <p>
-                Packet <code>{firstManualPacket.packetId}</code>
-                {firstManualPacket.role ? ` · ${firstManualPacket.role}` : ""}
-              </p>
+              <strong>Manual Pro response needed</strong>
+              <span>{firstManualPacket.role ?? "Research turn"}</span>
             </div>
-            <details className="manualDetails">
-              <summary>Review and respond</summary>
-              {firstManualPacket.prompt ? (
+            <details>
+              <summary>Open prompt and import response</summary>
+              {firstManualPacket.prompt && (
                 <>
                   <button
-                    className="textButton"
                     type="button"
+                    className="textButton"
                     onClick={() => void copyManualPrompt()}
                   >
                     Copy prompt
                   </button>
-                  <pre tabIndex={0}>{firstManualPacket.prompt}</pre>
+                  <pre>{firstManualPacket.prompt}</pre>
                 </>
-              ) : (
-                <p>The controller is preparing the prompt body.</p>
               )}
-              <label>
-                <span>Paste the Pro JSON response</span>
-                <textarea
-                  value={manualResponse}
-                  onChange={(event) => setManualResponse(event.target.value)}
-                  rows={6}
-                  spellCheck={false}
-                />
-              </label>
+              <textarea
+                rows={6}
+                value={manualResponse}
+                placeholder="Paste the JSON response"
+                onChange={(event) => setManualResponse(event.target.value)}
+              />
               <button
                 type="button"
                 className="button buttonPrimary"
                 disabled={
-                  !commandsAvailable ||
-                  !manualResponse.trim() ||
-                  commandPending !== null
+                  !manualResponse.trim() || commandPending !== null
                 }
                 onClick={() => void submitManualResponse()}
               >
-                Validate and resume
+                Import response
               </button>
             </details>
           </section>
         )}
 
-        <main id="main-content">
-          <section className="kpiGrid" aria-label="Campaign overview">
-            <KpiCard
-              label="Catalog"
-              value={data.counts.catalog}
-              detail="saved, vetted problems"
-              accent="#3478aa"
-            />
-            <KpiCard
-              label="Running"
-              value={`${runningProblems}/${configuredProblemSlots}`}
-              detail={`${inFlightCalls}/${maxConcurrentCalls} model calls in use`}
-              accent="#14786f"
-            />
-            <KpiCard
-              label="Waiting"
-              value={data.counts.queued}
-              detail="ranked for the next open slot"
-              accent="#6d7873"
-            />
-            <KpiCard
-              label="Resting"
-              value={restingProblems}
-              detail="saved after no final solution"
-              accent="#b07b27"
-            />
-            <KpiCard
-              label="Candidates"
-              value={data.counts.candidates}
-              detail="under independent checking"
-              accent="#7656a6"
-            />
-          </section>
-
-          <div className="workspaceGrid">
-            <section className="panel catalogPanel" aria-labelledby="queue-heading">
-              <div className="panelHeader">
-                <div>
-                  <p className="sectionKicker">All problems</p>
-                  <h2 id="queue-heading">Problems</h2>
-                </div>
-                <span className="rankHint">Highest priority first</span>
+        <main id="problems">
+          <section className="problemsPanel">
+            <div className="problemsHeader">
+              <div>
+                <h2>Problems</h2>
+                <p>
+                  {workingNow} working · {stateCounts.verifying} verifying ·{" "}
+                  {stateCounts.solved} solved · {stateCounts["no-solution"]} no
+                  solution yet
+                </p>
               </div>
-              <p className="panelIntro">
-                Select a problem to see its current stage, approaches, and saved
-                history.
-              </p>
-              <div className="nudgeBar" aria-label="Catalog nudges">
-                <button
-                  type="button"
-                  className="button buttonQuiet"
-                  disabled={
-                    !commandsAvailable ||
-                    !data.campaign ||
-                    commandPending !== null
-                  }
-                  onClick={requestMoreProblems}
-                  title="Runs another sourced and independently vetted discovery cycle"
-                >
-                  Find more problems
-                </button>
-                <form className="suggestProblemForm" onSubmit={suggestProblem}>
-                  <label className="srOnly" htmlFor="suggest-problem">
-                    Problem name or source URL
-                  </label>
-                  <input
-                    id="suggest-problem"
-                    type="text"
-                    value={problemSuggestion}
-                    maxLength={500}
-                    placeholder="Problem name or source URL"
-                    onChange={(event) =>
-                      setProblemSuggestion(event.target.value)
-                    }
-                    disabled={!commandsAvailable || !data.campaign}
-                  />
+              <details className="manageProblems">
+                <summary>Manage list</summary>
+                <div>
                   <button
-                    type="submit"
-                    className="button buttonQuiet"
+                    type="button"
+                    className="button buttonSecondary"
                     disabled={
                       !commandsAvailable ||
                       !data.campaign ||
-                      !problemSuggestion.trim() ||
                       commandPending !== null
                     }
+                    onClick={() =>
+                      void sendNudge("discover", "/api/catalog/discover")
+                    }
                   >
-                    Add
+                    Find more problems
                   </button>
-                </form>
-                {nudgeCommandsInFlight > 0 && (
-                  <span className="nudgeStatus">
-                    {nudgeCommandsInFlight} queued
-                  </span>
-                )}
-              </div>
-              {data.catalog.length ? (
-                <ol className="catalogList">
-                  {data.catalog.map((problem) => {
-                    const selected = problem.id === effectiveSelectedId;
-                    const liveProblem = data.activeProblems.find(
-                      (candidate) => candidate.id === problem.id,
-                    );
-                    return (
-                      <li key={problem.id}>
-                        <button
-                          type="button"
-                          className={`catalogItem ${selected ? "catalogItemSelected" : ""}`}
-                          aria-current={selected ? "true" : undefined}
-                          onClick={() => selectProblem(problem.id)}
-                        >
-                          <span className="catalogRank" aria-label={`Rank ${problem.rank}`}>
-                            {problem.rank}
-                          </span>
-                          <span className="catalogBody">
-                            <span className="catalogTopline">
-                              <strong>{problem.title}</strong>
-                              <StatusChip
-                                status={problem.lifecycle ?? problem.state}
-                              />
-                            </span>
-                            <span className="catalogDomain">{problem.domain}</span>
-                            <span className="catalogScores">
-                              <span>
-                                Interest <strong>{problem.interest.toFixed(1)}</strong>
-                              </span>
-                              <span>
-                                Solvability{" "}
-                                <strong>{problem.solvability.toFixed(1)}</strong>
-                              </span>
-                              <span className="catalogPriority">
-                                Priority <strong>{Math.round(problem.priority)}</strong>
-                              </span>
-                              {(problem.counterexampleBonus ?? 0) > 0 && (
-                                <span className="counterexampleLift">
-                                  Counterexample +
-                                  <strong>
-                                    {problem.counterexampleBonus?.toFixed(1)}
-                                  </strong>
-                                </span>
-                              )}
-                            </span>
-                            {(problem.attemptCount ?? 0) > 0 && (
-                              <span className="attemptFootprint">
-                                {problem.attemptCount} attempt
-                                {problem.attemptCount === 1 ? "" : "s"} ·{" "}
-                                {formatDuration(problem.totalActiveWorkMs ?? 0)} worked
-                                {" · "}
-                                {problem.totalCalls ?? 0} calls
-                                {(problem.failedAttemptCount ?? 0) > 0
-                                  ? ` · ${problem.failedAttemptCount} failed`
-                                  : ""}
-                              </span>
-                            )}
-                            <span className="problemStateLine">
-                              {problemStateLine(problem, liveProblem)}
-                            </span>
-                            {problem.workerSlot && (
-                              <span className="workerLease">
-                                <span aria-hidden="true">↳</span> {problem.workerSlot}
-                              </span>
-                            )}
-                          </span>
-                        </button>
-                      </li>
-                    );
-                  })}
-                </ol>
-              ) : (
-                <div className="emptyState">
-                  <strong>
-                    {connection === "connecting"
-                      ? "Connecting to the controller."
-                      : connection === "offline" && !data.campaign
-                        ? "No live campaign connection."
-                      : !data.campaign
-                        ? "No campaign has been started."
-                        : isActive
-                          ? "Discovery is building the first catalog."
-                          : "No vetted problems are available."}
-                  </strong>
-                  <span>
-                    {connection === "connecting"
-                      ? "Live campaign state will appear momentarily."
-                      : connection === "offline" && !data.campaign
-                        ? "Open the local controller at 127.0.0.1:4317 to start or monitor research."
-                      : !data.campaign
-                        ? "Choose your trial settings above, then press Start."
-                        : isActive
-                          ? "New problems will appear after their open status is vetted."
-                          : "Resume the campaign to run another discovery cycle."}
-                  </span>
-                </div>
-              )}
-            </section>
-
-            <section className="panel detailPanel" aria-labelledby="problem-heading">
-              {catalogProblem || activeProblem ? (
-                <>
-                  <div className="problemHeader">
-                    <div>
-                      <p className="sectionKicker">
-                        Selected problem ·{" "}
-                        {selectedProblemStage}
-                        {" · "}
-                        {activeProblem?.domain ?? catalogProblem?.domain}
-                      </p>
-                      <h2 id="problem-heading">
-                        {activeProblem?.title ?? catalogProblem?.title}
-                      </h2>
-                    </div>
-                    <StatusChip
-                      status={
-                        selectedProblemIsRunning
-                          ? (activeProblem?.status ?? "running")
-                          : (catalogProblem?.lifecycle ??
-                            catalogProblem?.state ??
-                            activeProblem?.status ??
-                            "queued")
+                  <form onSubmit={suggestProblem}>
+                    <label className="srOnly" htmlFor="suggest-problem">
+                      Problem name or source URL
+                    </label>
+                    <input
+                      id="suggest-problem"
+                      value={problemSuggestion}
+                      placeholder="Problem name or source URL"
+                      onChange={(event) =>
+                        setProblemSuggestion(event.target.value)
                       }
                     />
-                  </div>
-
-                  {catalogProblem && (
-                    <div className="scoreGrid" aria-label="Problem ranking">
-                      <ScoreMeter
-                        label="Interest"
-                        value={catalogProblem.interest}
-                        max={5}
-                      />
-                      <ScoreMeter
-                        label="Solvability"
-                        value={catalogProblem.solvability}
-                        max={5}
-                      />
-                      <ScoreMeter
-                        label="Priority"
-                        value={catalogProblem.priority}
-                        max={100}
-                        priority
-                      />
-                      {(catalogProblem.counterexampleOpportunity ?? 0) > 0 && (
-                        <ScoreMeter
-                          label="Counterexample"
-                          value={catalogProblem.counterexampleOpportunity ?? 0}
-                          max={5}
-                        />
-                      )}
-                    </div>
-                  )}
-
-                  {activeProblem ? (
-                    <>
-                      <section
-                        className="coordinatorNote"
-                        aria-labelledby="coordinator-heading"
-                      >
-                        <div className="noteIcon" aria-hidden="true">
-                          ∑
-                        </div>
-                        <div>
-                          <p className="sectionKicker">
-                            {selectedProblemIsRunning
-                              ? "Current attempt"
-                              : "Saved attempt"}
-                          </p>
-                          <h3 id="coordinator-heading">
-                            {selectedProblemIsRunning
-                              ? problemStage(activeProblem)
-                              : "Where this attempt stopped"}
-                          </h3>
-                          <p>
-                            {activeProblem.coordinatorNote ??
-                              "The first branch deltas are still being collected."}
-                          </p>
-                        </div>
-                        <div className="problemRuntime">
-                          <span className="activeTime">
-                            {formatDuration(activeProblem.activeWorkMs)}{" "}
-                            {selectedProblemIsRunning ? "active" : "worked"}
-                          </span>
-                          <small>{activeProblem.callsStarted ?? 0} calls</small>
-                          {selectedProblemIsRunning && activeProblem.attemptId && (
-                            <button
-                              type="button"
-                              className="textButton switchButton"
-                              disabled={
-                                !commandsAvailable ||
-                                commandPending !== null ||
-                                Boolean(activeProblem.switchRequestedAt)
-                              }
-                              onClick={switchSelectedProblem}
-                            >
-                              {activeProblem.switchRequestedAt
-                                ? "Switch pending"
-                                : "Move to another problem"}
-                            </button>
-                          )}
-                        </div>
-                      </section>
-
-                      {activeProblem.statement && (
-                        <details className="statementDisclosure">
-                          <summary>Exact problem statement and sources</summary>
-                          <p>{activeProblem.statement}</p>
-                          {activeProblem.sourceUrls?.length ? (
-                            <ul>
-                              {activeProblem.sourceUrls.map((url) => (
-                                <li key={url}>
-                                  <a href={url} target="_blank" rel="noreferrer">
-                                    {url}
-                                  </a>
-                                </li>
-                              ))}
-                            </ul>
-                          ) : null}
-                        </details>
-                      )}
-
-                      <AttemptHistory
-                        attempts={catalogProblem?.attemptHistory ?? []}
-                        preserved={selectedProblemIsRunning}
-                      />
-
-                      <section
-                        className="attemptsSection"
-                        aria-labelledby="attempts-heading"
-                      >
-                        <div className="subsectionHeading">
-                          <div>
-                            <p className="sectionKicker">
-                              {selectedProblemIsRunning
-                                ? "Current attempt"
-                                : "Saved work"}
-                            </p>
-                            <h3 id="attempts-heading">
-                              {selectedProblemIsRunning
-                                ? "Approaches for this problem"
-                                : "Approaches tried in this attempt"}
-                            </h3>
-                          </div>
-                          <span>
-                            {selectedProblemIsRunning
-                              ? activeProblem.branches.filter((branch) =>
-                                  ["running", "active", "verifying"].includes(
-                                    branch.status,
-                                  ),
-                                ).length
-                              : activeProblem.branches.length}{" "}
-                            {selectedProblemIsRunning ? "active" : "recorded"}
-                          </span>
-                        </div>
-                        {activeProblem.branches.length ? (
-                          <div className="branchList">
-                            {activeProblem.branches.map((branch) => {
-                            const latest = branch.history?.at(-1);
-                            return (
-                              <details
-                                className="branchCard"
-                                key={branch.id}
-                              >
-                                <summary>
-                                  <span
-                                    className={`branchRail status-${statusTone(
-                                      selectedProblemIsRunning
-                                        ? branch.status
-                                        : "saved",
-                                    )}`}
-                                    aria-hidden="true"
-                                  />
-                                  <span className="branchSummaryMain">
-                                    <span className="branchTitleRow">
-                                      <strong>{branch.title}</strong>
-                                      <StatusChip
-                                        status={
-                                          selectedProblemIsRunning
-                                            ? branch.status
-                                            : "saved"
-                                        }
-                                      />
-                                    </span>
-                                    <span className="branchMeta">
-                                      Turn {branch.turn} · Round {branch.round}
-                                    </span>
-                                    <span className="branchLatest">
-                                      {branch.latestSummary ??
-                                        latest?.summary ??
-                                        "Waiting for the first research delta."}
-                                    </span>
-                                  </span>
-                                  <span className="branchAction">
-                                    {titleCase(
-                                      branch.nextAction ??
-                                        latest?.nextAction ??
-                                        "waiting",
-                                    )}
-                                  </span>
-                                </summary>
-                                <div className="branchDetail">
-                                  {(branch.hypothesis || branch.falsifier) && (
-                                    <dl className="branchContract">
-                                      {branch.hypothesis && (
-                                        <div>
-                                          <dt>Hypothesis</dt>
-                                          <dd>{branch.hypothesis}</dd>
-                                        </div>
-                                      )}
-                                      {branch.falsifier && (
-                                        <div>
-                                          <dt>Falsifier</dt>
-                                          <dd>{branch.falsifier}</dd>
-                                        </div>
-                                      )}
-                                    </dl>
-                                  )}
-                                  <div className="branchFeedback">
-                                    <span>Coordinator note</span>
-                                    <p>
-                                      {branch.feedback ||
-                                        "No new direction has been issued."}
-                                    </p>
-                                  </div>
-                                  <div className="branchStats">
-                                    <span>
-                                      <strong>
-                                        {branch.verifiedFactsCount ?? 0}
-                                      </strong>{" "}
-                                      verified facts
-                                    </span>
-                                    <span>
-                                      <strong>
-                                        {branch.failedApproachesCount ?? 0}
-                                      </strong>{" "}
-                                      failed paths recorded
-                                    </span>
-                                    <span>
-                                      <strong>
-                                        {branch.noProgressEpochs ?? 0}
-                                      </strong>{" "}
-                                      stagnant rounds
-                                    </span>
-                                    {(branch.progressKind ??
-                                      latest?.progressKind) && (
-                                      <span className="evidenceTag">
-                                        {titleCase(
-                                          branch.progressKind ??
-                                            latest?.progressKind ??
-                                            "",
-                                        )}
-                                      </span>
-                                    )}
-                                  </div>
-                                </div>
-                              </details>
-                            );
-                            })}
-                          </div>
-                        ) : (
-                          <div className="emptyState compact">
-                            <strong>
-                              {selectedProblemIsRunning
-                                ? "Planning distinct approaches."
-                                : "No branch details were recorded."}
-                            </strong>
-                            <span>
-                              {selectedProblemIsRunning
-                                ? "They will appear here after the coordinator creates isolated workspaces for this problem."
-                                : "The attempt summary above is the complete saved report."}
-                            </span>
-                          </div>
-                        )}
-                      </section>
-
-                      <section
-                        className="verificationSection"
-                        aria-labelledby="verification-heading"
-                      >
-                        <div className="subsectionHeading">
-                          <div>
-                            <p className="sectionKicker">Adversarial checks</p>
-                            <h3 id="verification-heading">Verification</h3>
-                          </div>
-                          <span>{verificationRuns.length} candidate runs</span>
-                        </div>
-                        {verificationRuns.length ? (
-                          <div className="verificationList">
-                            {verificationRuns.map((run) => (
-                              <article
-                                className="verificationCard"
-                                key={run.candidateHash}
-                              >
-                                <div className="verificationTopline">
-                                  <div>
-                                    <span className="candidateHash">
-                                      Candidate {run.candidateHash.slice(0, 8)}
-                                    </span>
-                                    <h4>
-                                      {run.candidateClaim ??
-                                        "Candidate under independent review"}
-                                    </h4>
-                                  </div>
-                                  <StatusChip status={run.status} />
-                                </div>
-                                <ol className="passList">
-                                  {run.passes.map((pass) => (
-                                    <li key={pass.pass}>
-                                      <span
-                                        className={`passIndex status-${statusTone(pass.verdict)}`}
-                                      >
-                                        {pass.pass}
-                                      </span>
-                                      <span>
-                                        <strong>
-                                          Pass {pass.pass} ·{" "}
-                                          {titleCase(pass.verdict)}
-                                        </strong>
-                                        <small>{pass.note}</small>
-                                      </span>
-                                    </li>
-                                  ))}
-                                </ol>
-                              </article>
-                            ))}
-                          </div>
-                        ) : (
-                          <div className="emptyState compact">
-                            <strong>No candidate is under review yet.</strong>
-                            <span>
-                              Verifiers start automatically when a branch produces
-                              a checkable claim.
-                            </span>
-                          </div>
-                        )}
-                      </section>
-                    </>
-                  ) : (
-                    <div className="queuedDetail">
-                      <p className="sectionKicker">Current status</p>
-                      <h3>
-                        {catalogProblem
-                          ? inactiveProblemHeading(catalogProblem)
-                          : "Waiting for a problem slot"}
-                      </h3>
-                      <p>
-                        {catalogProblem
-                          ? problemStateLine(catalogProblem)
-                          :
-                          "This problem has passed vetting and is waiting in the ranked queue."}
-                      </p>
-                      {(catalogProblem?.counterexampleBonus ?? 0) > 0 &&
-                        catalogProblem?.counterexampleVerificationPlan && (
-                          <p className="counterexamplePlan">
-                            <strong>Counterexample route:</strong>{" "}
-                            {catalogProblem.counterexampleVerificationPlan}
-                          </p>
-                        )}
-                      {catalogProblem && (
-                        <div className="queuedActions">
-                          <button
-                            type="button"
-                            className="button buttonPrimary"
-                            disabled={
-                              !commandsAvailable ||
-                              commandPending !== null ||
-                              catalogProblem.operatorPinned ||
-                              !data.campaign
-                            }
-                            onClick={prioritizeSelectedProblem}
-                          >
-                            {prioritizeLabel(catalogProblem)}
-                          </button>
-                          <span>
-                            {(catalogProblem.lifecycle ??
-                              catalogProblem.state) === "cooldown"
-                              ? "Skips the normal rest period and puts it back in line."
-                              : "Moves this problem ahead of the automatic ranking."}
-                          </span>
-                        </div>
-                      )}
-                      {catalogProblem?.lastOutcome && (
-                        <p className="lastOutcome">
-                          Previous outcome: {catalogProblem.lastOutcome}
-                        </p>
-                      )}
-                      <AttemptHistory
-                        attempts={catalogProblem?.attemptHistory ?? []}
-                      />
-                    </div>
-                  )}
-                </>
-              ) : (
-                <div className="emptyState detailEmpty">
-                  <strong>No problem selected.</strong>
-                  <span>The coordinator is preparing the first ranked batch.</span>
+                    <button
+                      type="submit"
+                      className="button buttonSecondary"
+                      disabled={
+                        !problemSuggestion.trim() ||
+                        commandPending !== null
+                      }
+                    >
+                      Add
+                    </button>
+                  </form>
                 </div>
-              )}
-            </section>
-          </div>
-
-          <section className="panel notesPanel" aria-labelledby="notes-heading">
-            <div className="panelHeader notesHeader">
-              <div>
-                <p className="sectionKicker">Live, human-readable updates</p>
-                <h2 id="notes-heading">Research notes</h2>
-              </div>
-              <label className="diagnosticsToggle">
-                <input
-                  type="checkbox"
-                  checked={showDiagnostics}
-                  onChange={(event) => setShowDiagnostics(event.target.checked)}
-                />
-                <span aria-hidden="true" />
-                Show model diagnostics
-              </label>
+              </details>
             </div>
-            <p className="panelIntro">
-              Coordinator decisions, genuine information gain, failed routes, and
-              independent checks. Refreshes every two seconds without stealing
-              focus.
-            </p>
-            {visibleEvents.length ? (
-              <ol className="timeline">
-                {visibleEvents.map((event) => (
-                  <li key={event.id} className={`event-${event.level}`}>
-                    <div className="timelineMarker" aria-hidden="true" />
-                    <div className="timelineTime">
-                      <time dateTime={event.at}>{formatUtcTime(event.at)}</time>
-                      <span>{titleCase(event.kind)}</span>
-                    </div>
-                    <div className="timelineContent">
-                      <h3>{event.title}</h3>
+
+            {problemViews.length ? (
+              <div className="problemList">
+                {problemViews.map((view) => (
+                  <ProblemCard
+                    key={view.catalog.id}
+                    view={view}
+                    commandsAvailable={commandsAvailable}
+                    commandPending={commandPending}
+                    onPrioritize={prioritizeProblem}
+                    onSwitch={switchProblem}
+                  />
+                ))}
+              </div>
+            ) : (
+              <div className="emptyState">
+                <strong>
+                  {connection === "connecting"
+                    ? "Connecting to the controller…"
+                    : data.campaign
+                      ? "Finding open problems…"
+                      : "No campaign yet."}
+                </strong>
+                <span>
+                  {data.campaign
+                    ? "Problems appear here as soon as they pass vetting."
+                    : "Start a run above to build the problem list."}
+                </span>
+              </div>
+            )}
+          </section>
+
+          <details className="activityLog">
+            <summary>
+              <span>Activity</span>
+              <small>{data.events.length} saved updates</small>
+            </summary>
+            {data.events.length ? (
+              <ol>
+                {data.events.slice(0, 30).map((event) => (
+                  <li key={event.id}>
+                    <time dateTime={event.at}>
+                      {formatUtcTime(event.at)}
+                    </time>
+                    <div>
+                      <strong>{event.title}</strong>
                       <p>{event.note}</p>
-                    </div>
-                    <div className="timelineScope">
-                      {event.problemId && <span>{event.problemId}</span>}
-                      {event.branchId && <span>{event.branchId}</span>}
                     </div>
                   </li>
                 ))}
               </ol>
             ) : (
-              <div className="emptyState compact">
-                <strong>No research notes yet.</strong>
-                <span>Important updates will appear after the first agent turn.</span>
-              </div>
+              <p>No activity yet.</p>
             )}
-          </section>
+          </details>
         </main>
 
-        <footer className="appFooter">
-          <span>Autoprover keeps one canonical lease per problem.</span>
-          <span>Claims remain candidates until independently reproduced.</span>
+        <footer>
+          Candidates are not marked solved until independently reproduced.
         </footer>
       </div>
     </>

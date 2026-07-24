@@ -78,6 +78,7 @@ async function dashboardFixture(t, options = {}) {
     campaignSpawner: options.campaignSpawner,
     recoveryDelayMs: options.recoveryDelayMs,
     startupRecoveryDelayMs: options.startupRecoveryDelayMs,
+    externalProcessPollMs: options.externalProcessPollMs,
   });
   const address = dashboard.server.address();
   assert(address && typeof address === "object");
@@ -336,6 +337,42 @@ test("a continuous campaign restarts from durable state at startup and after a s
   }
   assert.equal(launches.length, 2);
   assert.deepEqual(launches[1], launches[0]);
+});
+
+test("a restarted dashboard attaches to a live locked campaign instead of duplicating it", async (t) => {
+  const launches = [];
+  let liveStore;
+  const { dashboardUrl } = await dashboardFixture(t, {
+    beforeStart: async ({ campaignDir, config }) => {
+      await initializeDashboardCampaign(campaignDir, config);
+      liveStore = new CampaignStore(campaignDir, {
+        catalogDir: path.resolve(config.runRoot, "_catalog"),
+      });
+      await liveStore.acquireCampaignLock();
+    },
+    campaignSpawner: (options) => {
+      launches.push(options.launch);
+      return fakeCampaignProcess();
+    },
+    recoveryDelayMs: 25,
+    startupRecoveryDelayMs: 25,
+    externalProcessPollMs: 25,
+  });
+
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(launches.length, 0);
+  const attached = await (
+    await fetch(`${dashboardUrl}/api/dashboard`)
+  ).json();
+  assert.equal(attached.server.campaignProcessRunning, true);
+
+  await liveStore.releaseCampaignLock();
+  const deadline = Date.now() + 2_000;
+  while (!launches.length && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(launches.length, 1);
+  assert.equal(launches[0].resume, true);
 });
 
 test("catalog nudge routes persist discovery, suggestion, priority, and switch commands", async (t) => {

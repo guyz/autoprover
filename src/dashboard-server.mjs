@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { closeSync, mkdirSync, openSync } from "node:fs";
 import { createServer, request as httpRequest } from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,6 +38,9 @@ export async function startDashboardServer(options = {}) {
   const commandToken =
     options.commandToken ?? randomBytes(24).toString("base64url");
   const recentProcessNotes = [];
+  const campaignStore = new CampaignStore(campaignDir, {
+    catalogDir: path.resolve(config.runRoot, "_catalog"),
+  });
   let campaignProcess = null;
   let frontendProcess = null;
   let resumeScheduled = false;
@@ -45,6 +49,7 @@ export async function startDashboardServer(options = {}) {
   const campaignSpawner = options.campaignSpawner ?? spawnCampaign;
   const recoveryDelayMs = options.recoveryDelayMs ?? 2_000;
   const startupRecoveryDelayMs = options.startupRecoveryDelayMs ?? 250;
+  const externalProcessPollMs = options.externalProcessPollMs ?? 5_000;
 
   const note = (level, message) => {
     recentProcessNotes.push({
@@ -54,6 +59,10 @@ export async function startDashboardServer(options = {}) {
     });
     if (recentProcessNotes.length > 80) recentProcessNotes.shift();
   };
+
+  const campaignIsRunning = async () =>
+    processIsRunning(campaignProcess) ||
+    Boolean(await campaignStore.readLiveCampaignLock());
 
   const launchCampaign = (launch) => {
     const child = campaignSpawner({
@@ -84,6 +93,10 @@ export async function startDashboardServer(options = {}) {
       recoveryTimer = null;
       if (closing || processIsRunning(campaignProcess)) return;
       try {
+        if (await campaignStore.readLiveCampaignLock()) {
+          scheduleContinuousRecovery(externalProcessPollMs);
+          return;
+        }
         const snapshot = await buildCampaignSnapshot({
           campaignDir,
           runRoot: config.runRoot,
@@ -237,14 +250,14 @@ export async function startDashboardServer(options = {}) {
             server: {
               local: true,
               commandToken,
-              campaignProcessRunning: processIsRunning(campaignProcess),
+              campaignProcessRunning: await campaignIsRunning(),
               recentProcessNotes,
             },
           });
         }
         if (req.method === "POST" && url.pathname === "/api/campaign/start") {
           requireCommandToken(req, commandToken);
-          if (processIsRunning(campaignProcess)) {
+          if (await campaignIsRunning()) {
             return sendJson(res, 409, {
               error: "A campaign process is already running",
             });
@@ -271,7 +284,7 @@ export async function startDashboardServer(options = {}) {
         }
         if (req.method === "POST" && url.pathname === "/api/campaign/resume") {
           requireCommandToken(req, commandToken);
-          if (processIsRunning(campaignProcess)) {
+          if (await campaignIsRunning()) {
             return sendJson(res, 409, {
               error: "The campaign process is already running",
             });
@@ -335,7 +348,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              processIsRunning(campaignProcess)
+              await campaignIsRunning()
                 ? "Fresh catalog discovery queued."
                 : "Fresh catalog discovery queued; press Continue to process it.",
           });
@@ -355,7 +368,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              processIsRunning(campaignProcess)
+              await campaignIsRunning()
                 ? "Requested problem queued for sourcing and independent vetting."
                 : "Requested problem saved; press Continue to source and vet it.",
           });
@@ -378,7 +391,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              processIsRunning(campaignProcess)
+              await campaignIsRunning()
                 ? "Problem queued to run next."
                 : "Problem priority saved; press Continue to apply it.",
           });
@@ -528,19 +541,31 @@ function spawnCampaign({ campaignDir, configPath, launch, note }) {
   const processArgs = keepAwake
     ? ["-im", process.execPath, ...args]
     : args;
-  const child = spawn(executable, processArgs, {
-    cwd: projectRoot,
-    env: { ...process.env, AUTOPROVER_CONFIRM: "1", NO_COLOR: "1" },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  mkdirSync(campaignDir, { recursive: true, mode: 0o700 });
+  const logHandle = openSync(
+    path.join(campaignDir, "controller.log"),
+    "a",
+    0o600,
+  );
+  let child;
+  try {
+    child = spawn(executable, processArgs, {
+      cwd: projectRoot,
+      detached: true,
+      windowsHide: true,
+      env: { ...process.env, AUTOPROVER_CONFIRM: "1", NO_COLOR: "1" },
+      stdio: ["ignore", logHandle, logHandle],
+    });
+  } finally {
+    closeSync(logHandle);
+  }
+  child.unref();
   if (keepAwake) {
     note(
       "info",
       "macOS idle sleep is inhibited while this campaign process is active.",
     );
   }
-  child.stdout.on("data", (chunk) => note("info", chunk.toString()));
-  child.stderr.on("data", (chunk) => note("warning", chunk.toString()));
   return child;
 }
 

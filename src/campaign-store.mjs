@@ -200,6 +200,12 @@ export class CampaignStore {
     return releasePidLock(this.lockPath);
   }
 
+  async readLiveCampaignLock() {
+    const owner = await readOptionalJson(this.lockPath);
+    if (!owner?.pid || !processAlive(owner.pid)) return null;
+    return structuredClone(owner);
+  }
+
   async withCatalogLock(callback) {
     const execute = async () => {
       await ensurePrivateDir(this.catalogDir);

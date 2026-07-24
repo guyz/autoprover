@@ -69,7 +69,9 @@ test("keeps compact controls, problem states, and metadata wired", async () => {
   assert.match(component, /Find more problems/);
   assert.match(component, /Run this problem next/);
   assert.match(component, /Stop this attempt and pick another/);
-  assert.match(component, /Resume for/);
+  assert.match(component, /Continue \+/);
+  assert.match(component, /Subscription calls renew automatically/);
+  assert.match(component, /Total API budget/);
   assert.match(component, /"Pause"/);
   assert.match(component, /Approaches running now/);
   assert.match(component, /Attempt history/);

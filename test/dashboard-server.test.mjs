@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { createServer } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import os from "node:os";
@@ -28,7 +29,18 @@ async function closeServer(server) {
   });
 }
 
-async function dashboardFixture(t) {
+function fakeCampaignProcess() {
+  const process = new EventEmitter();
+  process.exitCode = null;
+  process.signalCode = null;
+  process.kill = () => {
+    process.exitCode = 0;
+    process.emit("exit", 0, null);
+  };
+  return process;
+}
+
+async function dashboardFixture(t, options = {}) {
   const root = await mkdtemp(
     path.join(os.tmpdir(), "autoprover-dashboard-server-"),
   );
@@ -50,9 +62,12 @@ async function dashboardFixture(t) {
     runRoot: path.join(root, "runs"),
     wallClockHours: 24,
     parallelProblems: 2,
+    maxConcurrentCalls: 4,
     maxCalls: 60,
+    maxEstimatedUsd: 100,
     campaign: { maxCycles: 0 },
   };
+  await options.beforeStart?.({ campaignDir, config });
   const dashboard = await startDashboardServer({
     config,
     campaignDir,
@@ -60,6 +75,9 @@ async function dashboardFixture(t) {
     frontendUrl,
     spawnFrontend: false,
     port: 0,
+    campaignSpawner: options.campaignSpawner,
+    recoveryDelayMs: options.recoveryDelayMs,
+    startupRecoveryDelayMs: options.startupRecoveryDelayMs,
   });
   const address = dashboard.server.address();
   assert(address && typeof address === "object");
@@ -70,7 +88,58 @@ async function dashboardFixture(t) {
     await closeServer(frontend);
     await rm(root, { recursive: true, force: true });
   });
-  return { campaignDir, dashboardUrl, frontendUrl };
+  return { campaignDir, config, dashboardUrl, frontendUrl };
+}
+
+function activeCampaignState(config, overrides = {}) {
+  const now = new Date().toISOString();
+  return {
+    schemaVersion: 1,
+    campaignId: "dashboard-lifecycle",
+    provider: "max",
+    status: "running",
+    startedAt: now,
+    updatedAt: now,
+    deadlineAt: new Date(Date.now() + 6 * 60 * 60 * 1_000).toISOString(),
+    configSnapshot: structuredClone(config),
+    policy: {
+      durationHours: 6,
+      problemHours: 6,
+      parallelProblems: 2,
+      maxConcurrentCalls: 4,
+      maxCalls: 60,
+      callBudgetBatch: 60,
+      continuous: true,
+      maxEstimatedUsd: 100,
+    },
+    cycle: 0,
+    budget: {
+      callsStarted: 12,
+      callsCompleted: 12,
+      callsFailed: 0,
+      callsWaiting: 0,
+      inFlight: 0,
+      estimatedUsd: 0,
+    },
+    slots: [
+      { slotId: 1, status: "idle" },
+      { slotId: 2, status: "idle" },
+    ],
+    attempts: {},
+    notes: [],
+    stopReason: "",
+    ...overrides,
+  };
+}
+
+async function initializeDashboardCampaign(campaignDir, config, overrides) {
+  const store = new CampaignStore(campaignDir, {
+    catalogDir: path.resolve(config.runRoot, "_catalog"),
+  });
+  await store.initialize(
+    activeCampaignState(config, overrides),
+    emptyCatalog(),
+  );
 }
 
 test("idle dashboard has a render-safe shape and exposes its per-process command token", async (t) => {
@@ -144,6 +213,129 @@ test("an authorized safe stop is durable and a manual response cannot name an un
   );
   assert.equal(manualResponse.status, 404);
   assert.match((await manualResponse.json()).error, /manual packet/i);
+});
+
+test("start and resume routes preserve generic lifecycle settings", async (t) => {
+  const launches = [];
+  const first = await dashboardFixture(t, {
+    campaignSpawner: (options) => {
+      launches.push(options.launch);
+      return fakeCampaignProcess();
+    },
+  });
+  const headers = {
+    "content-type": "application/json",
+    "x-autoprover-command-token": COMMAND_TOKEN,
+  };
+
+  const startResponse = await fetch(
+    `${first.dashboardUrl}/api/campaign/start`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        provider: "max",
+        wallClockHours: 12,
+        parallelProblems: 6,
+        maxCalls: 40,
+        maxEstimatedUsd: 75,
+        continuous: true,
+      }),
+    },
+  );
+  assert.equal(startResponse.status, 202);
+  assert.deepEqual(launches[0], {
+    provider: "max",
+    wallClockHours: 12,
+    extendHours: undefined,
+    parallelProblems: 6,
+    maxCalls: 40,
+    maxEstimatedUsd: 75,
+    continuous: true,
+    resume: false,
+  });
+
+  const resumeLaunches = [];
+  const second = await dashboardFixture(t, {
+    beforeStart: ({ campaignDir, config }) =>
+      initializeDashboardCampaign(campaignDir, config, {
+        status: "stopped",
+        pausedAt: new Date().toISOString(),
+        pausedRemainingMs: 3 * 60 * 60 * 1_000,
+      }),
+    campaignSpawner: (options) => {
+      resumeLaunches.push(options.launch);
+      return fakeCampaignProcess();
+    },
+  });
+  const resumeResponse = await fetch(
+    `${second.dashboardUrl}/api/campaign/resume`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        extendHours: 5,
+        parallelProblems: 3,
+        continuous: true,
+      }),
+    },
+  );
+  assert.equal(resumeResponse.status, 202);
+  assert.deepEqual(resumeLaunches[0], {
+    provider: "max",
+    wallClockHours: undefined,
+    extendHours: 5,
+    parallelProblems: 3,
+    maxCalls: 60,
+    maxEstimatedUsd: 100,
+    continuous: true,
+    resume: true,
+  });
+});
+
+test("a continuous campaign restarts from durable state at startup and after a signal", async (t) => {
+  const launches = [];
+  const children = [];
+  const { dashboardUrl } = await dashboardFixture(t, {
+    beforeStart: ({ campaignDir, config }) =>
+      initializeDashboardCampaign(campaignDir, config),
+    campaignSpawner: (options) => {
+      launches.push(options.launch);
+      const child = fakeCampaignProcess();
+      children.push(child);
+      return child;
+    },
+    recoveryDelayMs: 25,
+    startupRecoveryDelayMs: 25,
+  });
+
+  const deadline = Date.now() + 2_000;
+  while (!launches.length && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+
+  assert.equal(launches.length, 1);
+  assert.deepEqual(launches[0], {
+    provider: "max",
+    wallClockHours: undefined,
+    extendHours: 0,
+    parallelProblems: 2,
+    maxCalls: 60,
+    maxEstimatedUsd: 100,
+    continuous: true,
+    resume: true,
+  });
+  const snapshot = await (await fetch(`${dashboardUrl}/api/dashboard`)).json();
+  assert.equal(snapshot.server.campaignProcessRunning, true);
+
+  children[0].signalCode = "SIGKILL";
+  children[0].emit("exit", null, "SIGKILL");
+  const restartDeadline = Date.now() + 2_000;
+  while (launches.length < 2 && Date.now() < restartDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(launches.length, 2);
+  assert.deepEqual(launches[1], launches[0]);
 });
 
 test("catalog nudge routes persist discovery, suggestion, priority, and switch commands", async (t) => {

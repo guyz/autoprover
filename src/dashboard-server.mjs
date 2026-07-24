@@ -40,6 +40,11 @@ export async function startDashboardServer(options = {}) {
   let campaignProcess = null;
   let frontendProcess = null;
   let resumeScheduled = false;
+  let recoveryTimer = null;
+  let closing = false;
+  const campaignSpawner = options.campaignSpawner ?? spawnCampaign;
+  const recoveryDelayMs = options.recoveryDelayMs ?? 2_000;
+  const startupRecoveryDelayMs = options.startupRecoveryDelayMs ?? 250;
 
   const note = (level, message) => {
     recentProcessNotes.push({
@@ -51,23 +56,86 @@ export async function startDashboardServer(options = {}) {
   };
 
   const launchCampaign = (launch) => {
-    campaignProcess = spawnCampaign({
+    const child = campaignSpawner({
       campaignDir,
       configPath: options.configPath,
       launch,
       note,
     });
-    campaignProcess.on("exit", (code, signal) => {
+    campaignProcess = child;
+    child.on("error", (error) => {
+      note("error", `Campaign process could not start: ${error.message}`);
+      if (campaignProcess === child) campaignProcess = null;
+      scheduleContinuousRecovery();
+    });
+    child.on("exit", (code, signal) => {
       note(
         code === 0 ? "info" : "error",
         `Campaign process exited (${code ?? signal ?? "unknown"}).`,
       );
+      scheduleContinuousRecovery();
     });
-    return campaignProcess;
+    return child;
+  };
+
+  const scheduleContinuousRecovery = (delayMs = recoveryDelayMs) => {
+    if (closing || recoveryTimer) return;
+    recoveryTimer = setTimeout(async () => {
+      recoveryTimer = null;
+      if (closing || processIsRunning(campaignProcess)) return;
+      try {
+        const snapshot = await buildCampaignSnapshot({
+          campaignDir,
+          runRoot: config.runRoot,
+        });
+        const campaign = snapshot.campaign;
+        if (
+          campaign?.continuous !== true ||
+          campaign.timeLeftMs <= 0 ||
+          ![
+            "running",
+            "discovering",
+            "ranking",
+            "attacking",
+            "verifying",
+            "budget-exhausted",
+          ].includes(campaign.status)
+        ) {
+          return;
+        }
+        note(
+          "warning",
+          "Continuous campaign was not running; restarting it from the last saved checkpoint.",
+        );
+        launchCampaign(
+          normalizeLaunch(
+            {
+              provider: campaign.provider,
+              extendHours: 0,
+              parallelProblems:
+                campaign.parallelProblems ?? config.parallelProblems,
+              maxCalls:
+                campaign.budget?.maxCalls ?? config.maxCalls,
+              maxEstimatedUsd:
+                campaign.budget?.maxEstimatedUsd ??
+                config.maxEstimatedUsd,
+              continuous: true,
+            },
+            config,
+            { resume: true },
+          ),
+        );
+      } catch (error) {
+        if (error.code !== "ENOENT") {
+          note("error", `Continuous recovery failed: ${error.message}`);
+          scheduleContinuousRecovery(10_000);
+        }
+      }
+    }, delayMs);
   };
 
   const scheduleCampaignResume = (launch) => {
-    if (campaignProcess?.exitCode === null) {
+    if (processIsRunning(campaignProcess)) {
       if (!resumeScheduled) {
         resumeScheduled = true;
         campaignProcess.once("exit", () => {
@@ -169,15 +237,14 @@ export async function startDashboardServer(options = {}) {
             server: {
               local: true,
               commandToken,
-              campaignProcessRunning:
-                Boolean(campaignProcess) && campaignProcess.exitCode === null,
+              campaignProcessRunning: processIsRunning(campaignProcess),
               recentProcessNotes,
             },
           });
         }
         if (req.method === "POST" && url.pathname === "/api/campaign/start") {
           requireCommandToken(req, commandToken);
-          if (campaignProcess?.exitCode === null) {
+          if (processIsRunning(campaignProcess)) {
             return sendJson(res, 409, {
               error: "A campaign process is already running",
             });
@@ -204,7 +271,7 @@ export async function startDashboardServer(options = {}) {
         }
         if (req.method === "POST" && url.pathname === "/api/campaign/resume") {
           requireCommandToken(req, commandToken);
-          if (campaignProcess?.exitCode === null) {
+          if (processIsRunning(campaignProcess)) {
             return sendJson(res, 409, {
               error: "The campaign process is already running",
             });
@@ -232,6 +299,14 @@ export async function startDashboardServer(options = {}) {
                 body.maxCalls ??
                 current.campaign.budget.maxCalls ??
                 config.maxCalls,
+              maxEstimatedUsd:
+                body.maxEstimatedUsd ??
+                current.campaign.budget.maxEstimatedUsd ??
+                config.maxEstimatedUsd,
+              continuous:
+                body.continuous ??
+                current.campaign.continuous ??
+                true,
             },
             config,
             { resume: true },
@@ -260,7 +335,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              campaignProcess?.exitCode === null
+              processIsRunning(campaignProcess)
                 ? "Fresh catalog discovery queued."
                 : "Fresh catalog discovery queued; press Continue to process it.",
           });
@@ -280,7 +355,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              campaignProcess?.exitCode === null
+              processIsRunning(campaignProcess)
                 ? "Requested problem queued for sourcing and independent vetting."
                 : "Requested problem saved; press Continue to source and vet it.",
           });
@@ -303,7 +378,7 @@ export async function startDashboardServer(options = {}) {
             accepted: true,
             commandId: command.id,
             message:
-              campaignProcess?.exitCode === null
+              processIsRunning(campaignProcess)
                 ? "Problem queued to run next."
                 : "Problem priority saved; press Continue to apply it.",
           });
@@ -371,6 +446,11 @@ export async function startDashboardServer(options = {}) {
                 config.parallelProblems,
               maxCalls:
                 snapshot.campaign?.budget?.maxCalls ?? config.maxCalls,
+              maxEstimatedUsd:
+                snapshot.campaign?.budget?.maxEstimatedUsd ??
+                config.maxEstimatedUsd,
+              continuous:
+                snapshot.campaign?.continuous ?? true,
             },
             config,
             { resume: true },
@@ -397,10 +477,13 @@ export async function startDashboardServer(options = {}) {
     server.once("error", reject);
     server.listen(port, host, resolve);
   });
+  scheduleContinuousRecovery(startupRecoveryDelayMs);
 
   const close = async () => {
+    closing = true;
+    if (recoveryTimer) clearTimeout(recoveryTimer);
     await new Promise((resolve) => server.close(resolve));
-    if (frontendProcess?.exitCode === null) frontendProcess.kill("SIGTERM");
+    if (processIsRunning(frontendProcess)) frontendProcess.kill("SIGTERM");
   };
   return {
     server,
@@ -422,6 +505,8 @@ function spawnCampaign({ campaignDir, configPath, launch, note }) {
     String(launch.parallelProblems),
     "--max-calls",
     String(launch.maxCalls),
+    "--max-usd",
+    String(launch.maxEstimatedUsd),
   ];
   if (launch.resume) {
     args.push("--resume", "--extend-hours", String(launch.extendHours));
@@ -433,18 +518,38 @@ function spawnCampaign({ campaignDir, configPath, launch, note }) {
       String(launch.wallClockHours),
     );
   }
+  if (launch.continuous) args.push("--continuous");
   if (launch.maxCycles !== undefined) {
     args.push("--max-cycles", String(launch.maxCycles));
   }
   if (configPath) args.push("--config", path.resolve(configPath));
-  const child = spawn(process.execPath, args, {
+  const keepAwake = process.platform === "darwin";
+  const executable = keepAwake ? "/usr/bin/caffeinate" : process.execPath;
+  const processArgs = keepAwake
+    ? ["-im", process.execPath, ...args]
+    : args;
+  const child = spawn(executable, processArgs, {
     cwd: projectRoot,
     env: { ...process.env, AUTOPROVER_CONFIRM: "1", NO_COLOR: "1" },
     stdio: ["ignore", "pipe", "pipe"],
   });
+  if (keepAwake) {
+    note(
+      "info",
+      "macOS idle sleep is inhibited while this campaign process is active.",
+    );
+  }
   child.stdout.on("data", (chunk) => note("info", chunk.toString()));
   child.stderr.on("data", (chunk) => note("warning", chunk.toString()));
   return child;
+}
+
+function processIsRunning(child) {
+  return Boolean(
+    child &&
+      child.exitCode === null &&
+      (child.signalCode === null || child.signalCode === undefined),
+  );
 }
 
 function normalizeLaunch(body, config, options = {}) {
@@ -481,12 +586,23 @@ function normalizeLaunch(body, config, options = {}) {
     100_000,
     "maxCalls",
   );
+  const maxEstimatedUsd = boundedNumber(
+    body.maxEstimatedUsd,
+    config.maxEstimatedUsd,
+    0,
+    1_000_000,
+    "maxEstimatedUsd",
+  );
+  const continuous =
+    body.continuous === undefined ? false : body.continuous === true;
   const launch = {
     provider,
     wallClockHours,
     extendHours,
     parallelProblems,
     maxCalls,
+    maxEstimatedUsd,
+    continuous,
     resume,
   };
   if (body.maxCycles !== undefined) {

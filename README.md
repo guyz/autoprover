@@ -24,13 +24,15 @@ npm install --prefix dashboard
 npm run dashboard
 ```
 
-Open the printed `http://127.0.0.1:4317/` URL, choose a provider, a 12- or 24-hour limit, parallel problem slots, and a call cap, then press **Start**. The page polls only the local controller and uses an in-memory command token for mutations. A hosted copy of the UI is a read-only demonstration; it cannot control a process on your computer.
+Open the printed `http://127.0.0.1:4317/` URL, choose a provider, a 12- or 24-hour limit, and the number of parallel problem slots, then press **Start**. The page polls only the local controller and uses an in-memory command token for mutations. A hosted copy of the UI is a read-only demonstration; it cannot control a process on your computer.
 
 The campaign keeps one persistent, deduplicated catalog under `runs/_catalog/`. When the ranked queue runs low it launches a fresh discovery-and-vetting cycle, records immutable packet versions, and rechecks stale open-status evidence. The displayed priority balances mathematical interest with predicted solvability, verifiability, source quality, prior progress, and a small exploration bonus. The rationale is visible for every row.
 
 Counterexample routes receive a bounded ranking lift only when discovery and independent vetting identify a concrete search space and decisive checker. A conjecture/disproof label alone receives no boost. Finite exact witnesses can add up to 8 priority points; less mechanically checkable routes receive less. See the [counterexample prioritization research note](docs/counterexample-prioritization.md) for the empirical basis and caveats.
 
-Each problem gets one fenced lease and one immutable child run directory. Free worker slots refill continuously, while every problem's internal strategies use isolated branch workspaces. A crash can resume the same discovery or attempt without replaying completed model calls. **Stop safely** prevents new model calls, lets calls already in flight checkpoint, and leaves the campaign resumable. Completed attempts remain in the dashboard with their coordinator report, branch histories, failed paths, artifacts, and verification passes.
+Each problem gets one fenced lease and one immutable child run directory. Free worker slots refill continuously, while every problem's internal strategies use isolated branch workspaces. A crash can resume the same discovery or attempt without replaying completed model calls. **Pause** prevents new model calls, lets calls already in flight checkpoint, freezes the unused campaign time, and leaves the campaign resumable. **Continue** restores those exact attempts; optionally adding time extends the frozen remainder rather than silently replacing it. Completed attempts remain in the dashboard with their coordinator report, branch histories, failed paths, artifacts, and verification passes.
+
+Dashboard campaigns are continuous by default. For subscription-backed `max` and `fable`, the configured call count is a renewal batch used for accounting and checkpointing; reaching it no longer ends a run before its wall-clock deadline. API-billed `pro` retains hard call and dollar caps. The local dashboard supervises a continuous child process and restarts it from durable state after an unexpected exit. On macOS it also inhibits idle system sleep while the campaign process is active.
 
 The queue includes four durable operator nudges:
 
@@ -45,12 +47,16 @@ The equivalent CLI commands are:
 
 ```bash
 node src/cli.mjs campaign --yes \
-  --provider max --hours 24 --parallel-problems 2 --max-calls 60
+  --provider max --hours 24 --parallel-problems 2 \
+  --max-calls 60 --continuous
 
-node src/cli.mjs campaign --yes --resume --extend-hours 12
+node src/cli.mjs campaign --yes --resume --continuous
+node src/cli.mjs campaign --yes --resume --extend-hours 12 --continuous
 ```
 
 `--max-cycles 0` means discovery can continue until the wall-clock or call/cost guard stops it. A positive value is useful for bounded evaluations. Campaign-global limits are enforced across every child run, so parallel workers cannot each consume the full call budget independently.
+
+`parallelProblems` and `maxConcurrentCalls` are different controls. For example, six problem slots with four concurrent calls means six problem portfolios remain active, but at most four model invocations run at once; the other portfolios wait for the shared call semaphore without losing their leases or state.
 
 ## Model choice
 
@@ -74,7 +80,7 @@ node src/cli.mjs run --yes --provider pro-manual
 
 The Fable adapter uses the full `claude-fable-5` model ID, Max effort, a separate resumable session for every branch, JSON Schema output, safe mode, and the local Claude.ai login. Its required `subscriptionOnly: true` setting removes Anthropic API/proxy environment variables before launching Claude so a subscription run cannot silently become an API-billed run. The Max adapter enforces the same subscription-only rule for Codex and strips OpenAI API billing credentials from its child process.
 
-The Max adapter similarly uses the ChatGPT-authenticated Codex CLI. The Pro adapter is the only provider whose token usage contributes to `maxEstimatedUsd`. Subscription-backed providers still obey `maxCalls` and the wall-clock deadline.
+The Max adapter similarly uses the ChatGPT-authenticated Codex CLI. The Pro adapter is the only provider whose token usage contributes to `maxEstimatedUsd`. Ordinary CLI runs treat `maxCalls` as a hard guard for every provider. A campaign started with `--continuous` renews that allowance only for subscription-backed providers and still stops at its wall-clock deadline.
 
 Run `npm run doctor` before a job. It checks both CLIs, supported Claude version, local authentication state, subscription type, API-key presence, and the selected provider. To prove live inference with one small structured call:
 
@@ -236,12 +242,12 @@ runs/<run-id>/
 
 `summary.json` is an index, not a proof report. For a no-result run, inspect the problem's `sharedState`, branch histories, `failedApproaches`, verification runs, stop reason, and artifact paths in `run.json`, then use `events.jsonl` for chronology. If the process crashes before summary export, `run.json` and `events.jsonl` remain the recovery sources. In the final 22+ hour phase, the research prompt asks branches to freeze speculation and produce precise partial-result and failure artifacts; whether useful artifacts exist still depends on what the workers actually found.
 
-`parallelProblems` limits the number of active problem portfolios. `maxConcurrentCalls` limits model calls across discovery, branches, synthesis, and verification. `branchesPerProblem` controls independent strategies per problem. The 12/24-hour setting is a wall-clock deadline, not one gigantic model call.
+`parallelProblems` limits the number of active problem portfolios. `maxConcurrentCalls` limits model calls across discovery, branches, synthesis, and verification. `branchesPerProblem` controls independent strategies per problem. The 12/24-hour setting is a wall-clock deadline, not one gigantic model call. When a campaign is paused, its remaining wall-clock allowance is stored durably and does not count down while the harness is offline.
 
 ## Cost and safety
 
 - API Pro+Max can be expensive. The API path refuses new calls after `maxCalls` or `maxEstimatedUsd`; calls already in flight can take the final token estimate beyond the dollar threshold. The estimate uses configured token prices and does not include every hosted-tool or external fee.
-- Max/Codex and Fable/Claude use subscription-managed allowances, for which this program does not calculate a billed dollar amount; `maxCalls` remains the hard guardrail.
+- Max/Codex and Fable/Claude use subscription-managed allowances, for which this program does not calculate a billed dollar amount. `maxCalls` is a hard guardrail unless an explicit continuous campaign turns it into a renewable accounting batch.
 - Manual Pro records zero token usage because ChatGPT does not expose usage data through the copy/paste workflow.
 - Responses workers use OpenAI-hosted web search and sandboxed Code Interpreter. The Codex fallback uses `workspace-write` and isolated branch workspaces by default.
 - Automatic discovery can still misunderstand a variant or miss a recent paper. Every discovered problem is independently vetted before selection, but a human should audit the exact statement and precedence before public claims.

@@ -15,9 +15,11 @@ type Campaign = {
   phase: string;
   cycle: number;
   provider: string;
+  continuous?: boolean;
   parallelProblems?: number;
   maxConcurrentCalls?: number;
   timeLeftMs: number;
+  pausedAt?: string | null;
   latestNote?: string;
   budget: {
     callsStarted: number;
@@ -25,6 +27,9 @@ type Campaign = {
     callsFailed: number;
     inFlight?: number;
     maxCalls: number;
+    callBudgetBatch?: number;
+    estimatedUsd?: number;
+    maxEstimatedUsd?: number;
   };
 };
 
@@ -133,6 +138,7 @@ type OperatorCommand = {
 
 type DashboardServer = {
   commandToken?: string | null;
+  campaignProcessRunning?: boolean;
   recentProcessNotes?: Array<{
     at: string;
     level: string;
@@ -157,6 +163,7 @@ type CampaignSettings = {
   hours: number;
   parallelProblems: number;
   maxCalls: number;
+  maxEstimatedUsd: number;
 };
 
 type ProblemState =
@@ -395,6 +402,21 @@ function campaignIsActive(campaign: Campaign | null) {
   return campaign ? ACTIVE_CAMPAIGN_STATES.has(campaign.status) : false;
 }
 
+function campaignStatusLabel(
+  campaign: Campaign,
+  campaignProcessRunning = true,
+) {
+  if (campaignIsActive(campaign)) {
+    return campaignProcessRunning ? "Running" : "Recovering";
+  }
+  if (campaign.status === "budget-exhausted") return "Call limit reached";
+  if (campaign.status === "deadline-reached") return "Time limit reached";
+  if (["stopped", "paused"].includes(campaign.status)) return "Paused";
+  if (campaign.status === "awaiting-manual") return "Waiting for input";
+  if (campaign.status === "catalog-exhausted") return "Needs more problems";
+  return titleCase(campaign.status);
+}
+
 function classifyProblem(
   catalog: CatalogProblem,
   live?: ResearchProblem,
@@ -433,24 +455,32 @@ function classifyProblem(
     return "candidate";
   }
   if (live && LIVE_PROBLEM_STATES.has(live.status)) return "working";
+  const latestOutcome =
+    catalog.attemptHistory?.at(-1)?.outcome ?? catalog.lastOutcome ?? "";
   if (
+    latestOutcome === "interrupted" ||
     ["paused", "stopped", "deadline-reached", "budget-exhausted"].includes(
       lifecycle,
+    ) ||
+    (
+      saved &&
+      ["paused", "stopped", "deadline-reached", "budget-exhausted"].includes(
+        saved.status,
+      )
     )
   ) {
     return "paused";
   }
   if (
     lifecycle === "quarantined" ||
-    catalog.lastOutcome === "failed" ||
-    catalog.attemptHistory?.at(-1)?.outcome === "failed"
+    latestOutcome === "failed"
   ) {
     return "failed";
   }
   if (
     ["cooldown", "retired"].includes(lifecycle) ||
     ["progress-no-solution", "no-result"].includes(
-      catalog.lastOutcome ?? "",
+      latestOutcome,
     )
   ) {
     return "no-solution";
@@ -469,7 +499,7 @@ function problemHeadline(view: ProblemView) {
       ? `${count} approach${count === 1 ? "" : "es"} in progress`
       : "Preparing research approaches";
   }
-  if (state === "paused") return "Saved at a checkpoint";
+  if (state === "paused") return "Saved at a checkpoint; ready to continue";
   if (state === "failed") return "Attempt ended with an error";
   if (state === "no-solution") return "Attempt ended without a final solution";
   return "Waiting to be picked up";
@@ -792,7 +822,11 @@ export default function AutoproverDashboard() {
     hours: 24,
     parallelProblems: 2,
     maxCalls: 60,
+    maxEstimatedUsd: 100,
   });
+  const [resumeExtraHours, setResumeExtraHours] = useState<number | null>(
+    null,
+  );
   const [commandPending, setCommandPending] = useState<string | null>(null);
   const [feedback, setFeedback] = useState("");
   const [problemSuggestion, setProblemSuggestion] = useState("");
@@ -829,6 +863,9 @@ export default function AutoproverDashboard() {
             parallelProblems:
               next.campaign?.parallelProblems ?? current.parallelProblems,
             maxCalls: next.campaign?.budget.maxCalls ?? current.maxCalls,
+            maxEstimatedUsd:
+              next.campaign?.budget.maxEstimatedUsd ??
+              current.maxEstimatedUsd,
           }));
         }
       } catch {
@@ -850,6 +887,8 @@ export default function AutoproverDashboard() {
   }, []);
 
   const isActive = campaignIsActive(data.campaign);
+  const campaignProcessRunning =
+    data.server.campaignProcessRunning !== false;
   const isStopping = data.campaign?.status === "stopping";
   const canResume = Boolean(
     data.campaign && RESUMABLE_CAMPAIGN_STATES.has(data.campaign.status),
@@ -868,6 +907,23 @@ export default function AutoproverDashboard() {
         (data.campaign?.budget.callsFailed ?? 0),
     );
   const maxConcurrentCalls = data.campaign?.maxConcurrentCalls ?? 4;
+  const configuredProblemSlots =
+    data.campaign?.parallelProblems ?? settings.parallelProblems;
+  const isContinuous =
+    data.campaign?.continuous === true &&
+    data.campaign.provider !== "pro";
+  const effectiveResumeExtraHours =
+    resumeExtraHours ??
+    (data.campaign?.status === "deadline-reached" ? 24 : 0);
+  const apiResumeNeedsHigherLimit = Boolean(
+    data.campaign?.provider === "pro" &&
+      data.campaign.status === "budget-exhausted" &&
+      (
+        data.campaign.budget.callsStarted >= settings.maxCalls ||
+        (data.campaign.budget.estimatedUsd ?? 0) >=
+          settings.maxEstimatedUsd
+      ),
+  );
   const callPercent = data.campaign?.budget.maxCalls
     ? Math.min(
         100,
@@ -876,9 +932,6 @@ export default function AutoproverDashboard() {
           100,
       )
     : 0;
-  const resumedCallAllowance = data.campaign
-    ? Math.max(0, settings.maxCalls - data.campaign.budget.callsStarted)
-    : settings.maxCalls;
   const firstManualPacket = data.manualQueue[0];
   const problemViews: ProblemView[] = data.catalog
     .map((catalog) => {
@@ -1014,6 +1067,7 @@ export default function AutoproverDashboard() {
       wallClockHours: settings.hours,
       parallelProblems: settings.parallelProblems,
       maxCalls: settings.maxCalls,
+      maxEstimatedUsd: settings.maxEstimatedUsd,
       continuous: true,
     });
   }
@@ -1125,32 +1179,42 @@ export default function AutoproverDashboard() {
             <>
               <div className="campaignState">
                 <span
-                  className={`runDot ${isActive ? "runDotActive" : ""}`}
+                  className={`runDot ${
+                    isActive && campaignProcessRunning ? "runDotActive" : ""
+                  }`}
                   aria-hidden="true"
                 />
                 <div>
                   <strong>
-                    {isActive
-                      ? "Running"
-                      : canResume
-                        ? "Paused"
-                        : titleCase(data.campaign.status)}
+                    {campaignStatusLabel(
+                      data.campaign,
+                      campaignProcessRunning,
+                    )}
                   </strong>
                   <span>
-                    {workingNow} problem{workingNow === 1 ? "" : "s"} working
+                    {isActive && !campaignProcessRunning
+                      ? "Restarting from the last saved checkpoint"
+                      : isActive
+                      ? `${workingNow}/${configuredProblemSlots} problems active`
+                      : data.campaign.status === "budget-exhausted"
+                        ? data.campaign.provider === "pro"
+                          ? "Work is saved; raise the API limit to continue"
+                          : "Work is saved; press Continue"
+                        : `${workingNow} problem${workingNow === 1 ? "" : "s"} working`}
                   </span>
                 </div>
               </div>
               <div className="campaignMetric">
                 <strong>{formatDuration(data.campaign.timeLeftMs)}</strong>
-                <span>remaining</span>
+                <span>{isActive ? "remaining" : "saved time"}</span>
               </div>
               <div className="campaignMetric">
-                <strong>
-                  {data.campaign.budget.callsStarted}/
-                  {data.campaign.budget.maxCalls}
-                </strong>
-                <span>calls</span>
+                <strong>{data.campaign.budget.callsStarted}</strong>
+                <span>
+                  {isContinuous
+                    ? "calls used"
+                    : `of ${data.campaign.budget.maxCalls} calls`}
+                </span>
               </div>
               <div className="campaignMetric campaignMetricSecondary">
                 <strong>
@@ -1183,40 +1247,44 @@ export default function AutoproverDashboard() {
                   disabled={
                     !commandsAvailable ||
                     commandPending !== null ||
-                    resumedCallAllowance === 0
+                    apiResumeNeedsHigherLimit
                   }
                   onClick={() =>
                     void sendCommand("resume", {
-                      extendHours: settings.hours,
+                      extendHours: effectiveResumeExtraHours,
                       provider: settings.provider,
                       parallelProblems: settings.parallelProblems,
                       maxCalls: settings.maxCalls,
+                      maxEstimatedUsd: settings.maxEstimatedUsd,
+                      continuous: true,
                     })
                   }
                 >
                   {commandPending === "resume"
                     ? "Resuming…"
-                    : `Resume for ${settings.hours}h`}
+                    : effectiveResumeExtraHours > 0
+                      ? `Continue +${effectiveResumeExtraHours}h`
+                      : "Continue"}
                 </button>
               )}
-              <div className="callProgress" aria-hidden="true">
-                <span style={{ width: `${callPercent}%` }} />
-              </div>
+              {!isContinuous && (
+                <div className="callProgress" aria-hidden="true">
+                  <span style={{ width: `${callPercent}%` }} />
+                </div>
+              )}
               {canResume && (
                 <details className="runSettings">
                   <summary>Change resume limits</summary>
                   <div>
                     <label>
-                      <span>Add time</span>
+                      <span>Add time (optional)</span>
                       <select
-                        value={settings.hours}
+                        value={effectiveResumeExtraHours}
                         onChange={(event) =>
-                          setSettings((current) => ({
-                            ...current,
-                            hours: Number(event.target.value),
-                          }))
+                          setResumeExtraHours(Number(event.target.value))
                         }
                       >
+                        <option value={0}>No extra time</option>
                         <option value={1}>1 hour</option>
                         <option value={2}>2 hours</option>
                         <option value={12}>12 hours</option>
@@ -1241,26 +1309,54 @@ export default function AutoproverDashboard() {
                         }
                       />
                     </label>
-                    <label>
-                      <span>Total call cap</span>
-                      <input
-                        type="number"
-                        min={data.campaign.budget.callsStarted}
-                        value={settings.maxCalls}
-                        onChange={(event) =>
-                          setSettings((current) => ({
-                            ...current,
-                            maxCalls: Math.max(
-                              data.campaign?.budget.callsStarted ?? 1,
-                              Number(event.target.value) || 1,
-                            ),
-                          }))
-                        }
-                      />
-                    </label>
+                    {data.campaign.provider === "pro" && (
+                      <>
+                        <label>
+                          <span>Total API call cap</span>
+                          <input
+                            type="number"
+                            min={data.campaign.budget.callsStarted}
+                            value={settings.maxCalls}
+                            onChange={(event) =>
+                              setSettings((current) => ({
+                                ...current,
+                                maxCalls: Math.max(
+                                  data.campaign?.budget.callsStarted ?? 1,
+                                  Number(event.target.value) || 1,
+                                ),
+                              }))
+                            }
+                          />
+                        </label>
+                        <label>
+                          <span>Total API budget ($)</span>
+                          <input
+                            type="number"
+                            min={data.campaign.budget.estimatedUsd ?? 0}
+                            step="1"
+                            value={settings.maxEstimatedUsd}
+                            onChange={(event) =>
+                              setSettings((current) => ({
+                                ...current,
+                                maxEstimatedUsd: Math.max(
+                                  data.campaign?.budget.estimatedUsd ?? 0,
+                                  Number(event.target.value) || 0,
+                                ),
+                              }))
+                            }
+                          />
+                        </label>
+                      </>
+                    )}
                   </div>
-                  {resumedCallAllowance === 0 && (
-                    <p>Raise the total call cap before resuming.</p>
+                  {apiResumeNeedsHigherLimit && (
+                    <p>Raise the exhausted API call or dollar limit.</p>
+                  )}
+                  {isContinuous && (
+                    <p>
+                      Subscription calls renew automatically until the saved
+                      time runs out.
+                    </p>
                   )}
                 </details>
               )}
@@ -1336,24 +1432,52 @@ export default function AutoproverDashboard() {
                       }
                     />
                   </label>
-                  <label>
-                    <span>Call cap</span>
-                    <input
-                      type="number"
-                      min={1}
-                      value={settings.maxCalls}
-                      onChange={(event) =>
-                        setSettings((current) => ({
-                          ...current,
-                          maxCalls: Math.max(
-                            1,
-                            Number(event.target.value) || 1,
-                          ),
-                        }))
-                      }
-                    />
-                  </label>
+                  {settings.provider === "pro" && (
+                    <>
+                      <label>
+                        <span>Total API call cap</span>
+                        <input
+                          type="number"
+                          min={1}
+                          value={settings.maxCalls}
+                          onChange={(event) =>
+                            setSettings((current) => ({
+                              ...current,
+                              maxCalls: Math.max(
+                                1,
+                                Number(event.target.value) || 1,
+                              ),
+                            }))
+                          }
+                        />
+                      </label>
+                      <label>
+                        <span>Total API budget ($)</span>
+                        <input
+                          type="number"
+                          min={0}
+                          step="1"
+                          value={settings.maxEstimatedUsd}
+                          onChange={(event) =>
+                            setSettings((current) => ({
+                              ...current,
+                              maxEstimatedUsd: Math.max(
+                                0,
+                                Number(event.target.value) || 0,
+                              ),
+                            }))
+                          }
+                        />
+                      </label>
+                    </>
+                  )}
                 </div>
+                {settings.provider !== "pro" && (
+                  <p>
+                    Subscription calls renew automatically until the selected
+                    time runs out.
+                  </p>
+                )}
               </details>
             </form>
           )}
@@ -1411,8 +1535,8 @@ export default function AutoproverDashboard() {
                 <h2>Problems</h2>
                 <p>
                   {workingNow} working · {stateCounts.verifying} verifying ·{" "}
-                  {stateCounts.solved} solved · {stateCounts["no-solution"]} no
-                  solution yet
+                  {stateCounts.solved} solved · {stateCounts.paused} saved ·{" "}
+                  {stateCounts["no-solution"]} no solution yet
                 </p>
               </div>
               <details className="manageProblems">

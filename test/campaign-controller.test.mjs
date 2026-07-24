@@ -206,6 +206,7 @@ async function campaignFixture(
     problems = [problem(1), problem(2), problem(3)],
     parallelProblems = 2,
     maxCalls = 30,
+    providerName = "max",
     policy = {},
   } = {},
 ) {
@@ -235,7 +236,7 @@ async function campaignFixture(
   const controller = await CampaignController.create({
     config,
     provider,
-    providerName: "max",
+    providerName,
     campaignDir,
     policy: {
       durationHours: 1,
@@ -273,7 +274,11 @@ test(
   async (t) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "autoprover-campaign-e2e-"));
     t.after(() => rm(root, { recursive: true, force: true }));
-    const setup = await campaignFixture(root);
+    const setup = await campaignFixture(root, {
+      // Keep fake calls open long enough for the second problem to enter the
+      // shared semaphore even when the test runs beside CPU-heavy live agents.
+      provider: new TrackingFixtureProvider({ delayMs: 300 }),
+    });
 
     const snapshot = await setup.controller.run();
 
@@ -355,6 +360,92 @@ test(
     );
     assert.equal(setup.controller.state.budget.inFlight, 0);
     assert.equal(setup.controller.state.status, "budget-exhausted");
+  },
+);
+
+test(
+  "a continuous subscription campaign renews call batches until its time boundary",
+  { timeout: 8_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-continuous-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const provider = new TrackingFixtureProvider({ delayMs: 15 });
+    const setup = await campaignFixture(root, {
+      provider,
+      parallelProblems: 3,
+      maxCalls: 2,
+      policy: {
+        continuous: true,
+        callBudgetBatch: 2,
+      },
+    });
+
+    const snapshot = await setup.controller.run();
+
+    assert.equal(provider.calls.length, 9);
+    assert.equal(setup.controller.state.budget.callsStarted, 9);
+    assert.equal(setup.controller.state.status, "completed");
+    assert.equal(snapshot.campaign.continuous, true);
+    assert.ok(setup.controller.state.policy.maxCalls >= 10);
+    assert.equal(setup.controller.state.policy.callBudgetBatch, 2);
+    assert.ok(
+      setup.controller.state.notes.some((note) =>
+        /renewed its call allowance/i.test(note.message),
+      ),
+    );
+  },
+);
+
+test(
+  "an API-billed campaign keeps its hard call cap even if continuous is requested",
+  { timeout: 8_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-api-cap-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const provider = new TrackingFixtureProvider({ delayMs: 15 });
+    const setup = await campaignFixture(root, {
+      provider,
+      providerName: "pro",
+      parallelProblems: 3,
+      maxCalls: 2,
+      policy: {
+        continuous: true,
+        callBudgetBatch: 2,
+      },
+    });
+
+    const snapshot = await setup.controller.run();
+
+    assert.equal(provider.calls.length, 2);
+    assert.equal(snapshot.campaign.status, "budget-exhausted");
+    assert.equal(setup.controller.state.policy.maxCalls, 2);
+    assert.equal(setup.controller.state.budget.callsStarted, 2);
+  },
+);
+
+test(
+  "a campaign whose deadline has already arrived starts no discovery or research",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-deadline-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const setup = await campaignFixture(root);
+    setup.controller.state.deadlineAt = new Date(
+      Date.now() - 1_000,
+    ).toISOString();
+
+    const snapshot = await setup.controller.run();
+
+    assert.equal(snapshot.campaign.status, "deadline-reached");
+    assert.equal(snapshot.campaign.timeLeftMs, 0);
+    assert.equal(setup.provider.calls.length, 0);
+    assert.deepEqual(setup.discoveryCycles, []);
   },
 );
 
@@ -636,8 +727,13 @@ test(
     const setup = await campaignFixture(root);
     const originalDeadline = Date.parse(setup.controller.state.deadlineAt);
     await requestCampaignStop(setup.campaignDir, "Pause before discovery");
-    await setup.controller.run();
+    const stoppedSnapshot = await setup.controller.run();
     assert.equal(setup.controller.state.status, "stopped");
+    assert.ok(setup.controller.state.pausedRemainingMs > 0);
+    assert.equal(
+      stoppedSnapshot.campaign.timeLeftMs,
+      setup.controller.state.pausedRemainingMs,
+    );
 
     const resumeDiscoveryCycles = [];
     const resumedProvider = new TrackingFixtureProvider();

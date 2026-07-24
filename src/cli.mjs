@@ -287,6 +287,13 @@ async function runCampaign(flags) {
   }
 
   const selectedProvider = resolveProviderName(config);
+  const continuous =
+    flags.continuous === true ||
+    (
+      shouldResume &&
+      flags.continuous === undefined &&
+      stored?.policy?.continuous === true
+    );
   requireLiveConfirmation(flags, {
     action: shouldResume
       ? "resume the persistent discovery and research campaign"
@@ -302,6 +309,7 @@ async function runCampaign(flags) {
     parallelProblems: config.parallelProblems,
     maxCalls: config.maxCalls,
     maxEstimatedUsd: config.maxEstimatedUsd,
+    continuous,
     maxDiscoveryCycles: config.campaign.maxCycles || "unlimited until another guard stops it",
   });
 
@@ -311,6 +319,7 @@ async function runCampaign(flags) {
     parallelProblems: config.parallelProblems,
     maxCalls: config.maxCalls,
     maxEstimatedUsd: config.maxEstimatedUsd,
+    continuous,
   };
   const controller = shouldResume
     ? await CampaignController.resume({
@@ -568,6 +577,7 @@ export function validateCommandFlags(command, flags, extraPositionals = []) {
       "max-calls",
       "max-usd",
       "max-cycles",
+      "continuous",
       "resume",
       "yes",
       "help",
@@ -596,8 +606,8 @@ Usage:
   node src/cli.mjs smoke --yes --provider max|pro|fable
   node src/cli.mjs validate --problem-file problems.json
   node src/cli.mjs discover [--config config.json] [--problem-file problems.json]
-  node src/cli.mjs campaign --yes [--hours 24] [--parallel-problems 2]
-  node src/cli.mjs campaign --yes --resume [--extend-hours 12]
+  node src/cli.mjs campaign --yes [--hours 24] [--parallel-problems 2] [--continuous]
+  node src/cli.mjs campaign --yes --resume [--extend-hours 12] [--continuous]
   node src/cli.mjs run --yes [--config config.json] [--hours 12] [--problem-file problems.json]
   node src/cli.mjs resume --yes --run-dir runs/<id> [--extend-hours 12]
   node src/cli.mjs status [--run-dir runs/<id>]
@@ -611,6 +621,7 @@ Important flags:
   --max-calls N
   --max-usd N
   --max-cycles N      Campaign discovery cycles; 0 means deadline/budget limited
+  --continuous        Subscription providers renew call allowance until the deadline
 
 Provider selection:
   max        GPT-5.6 Sol through the ChatGPT-authenticated Codex CLI, Max effort

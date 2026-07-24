@@ -208,6 +208,7 @@ export class CampaignController {
           this.state.status = "running";
           this.state.stopReason = "";
         }
+        await this.restoreLegacyBoundaryAttempts();
         await this.store.event("campaign.resumed", {
           extendHours,
           deadlineAt: this.state.deadlineAt,
@@ -309,6 +310,116 @@ export class CampaignController {
     }
   }
 
+  async restoreLegacyBoundaryAttempts() {
+    const catalog = await this.store.loadCatalog();
+    const attempts = Object.values(this.state.attempts ?? {})
+      .filter(
+        (attempt) =>
+          attempt.projectedAt &&
+          !attempt.switchRequestedAt &&
+          attempt.status === "completed",
+      )
+      .sort((left, right) =>
+        String(right.completedAt ?? right.projectedAt).localeCompare(
+          String(left.completedAt ?? left.projectedAt),
+        ),
+      );
+    const consideredProblems = new Set();
+    for (const attempt of attempts) {
+      if (consideredProblems.has(attempt.problemKey)) continue;
+      consideredProblems.add(attempt.problemKey);
+      if (
+        this.state.slots.some(
+          (slot) =>
+            slot.status !== "idle" && slot.problemKey === attempt.problemKey,
+        ) ||
+        Object.values(this.state.attempts).some(
+          (other) =>
+            other.attemptId !== attempt.attemptId &&
+            other.problemKey === attempt.problemKey &&
+            !other.projectedAt,
+        )
+      ) {
+        continue;
+      }
+      const entry = catalog.entries?.[attempt.problemKey];
+      const record = entry?.attempts?.find(
+        (candidate) => candidate.attemptId === attempt.attemptId,
+      );
+      if (!record || record.hasCandidate) continue;
+      const child = await readChildState(attempt.runDir);
+      const stoppedAtBoundary =
+        ["deadline-reached", "budget-exhausted"].includes(child?.status) ||
+        child?.problems?.some((problem) =>
+          ["deadline-reached", "budget-exhausted"].includes(problem.status),
+        ) ||
+        (
+          record.outcome === "interrupted" &&
+          /configured stop boundary/i.test(record.note ?? attempt.note ?? "")
+        );
+      if (!stoppedAtBoundary) continue;
+      const slot = this.state.slots.find((candidate) => candidate.status === "idle");
+      if (!slot) break;
+      const lease = await this.store.acquireLease(attempt.problemKey, {
+        ownerId: `${this.state.campaignId}:${slot.slotId}`,
+        slotId: slot.slotId,
+        attemptId: attempt.attemptId,
+        runDir: attempt.runDir,
+        ttlMs: this.policy.leaseTtlMs,
+      });
+      if (!lease) continue;
+      let restored = false;
+      await this.store.withCatalogLock(async (lockedCatalog) => {
+        const lockedEntry = lockedCatalog.entries?.[attempt.problemKey];
+        if (!lockedEntry || !leaseTokenMatches(lockedEntry, lease)) return;
+        const before = lockedEntry.attempts?.length ?? 0;
+        lockedEntry.attempts = (lockedEntry.attempts ?? []).filter(
+          (candidate) => candidate.attemptId !== attempt.attemptId,
+        );
+        if (lockedEntry.attempts.length === before) return;
+        lockedEntry.lifecycle = "eligible";
+        lockedEntry.cooldownUntil = null;
+        lockedEntry.latestNote =
+          "Recovered a saved attempt that an older controller finalized at a campaign boundary.";
+        lockedEntry.ranking = scoreCatalogEntry(lockedEntry);
+        restored = true;
+      });
+      if (!restored) {
+        await this.store.releaseLease(attempt.problemKey, lease);
+        continue;
+      }
+      Object.assign(attempt, {
+        status: "paused",
+        completedAt: null,
+        projectedAt: null,
+        outcome: null,
+        lease,
+        pausedAt: nowIso(),
+        pauseReason: "Recovered from a legacy campaign-boundary projection",
+        recoveredBoundaryProjection: true,
+      });
+      Object.assign(slot, {
+        status: "paused",
+        problemKey: attempt.problemKey,
+        attemptId: attempt.attemptId,
+        runDir: attempt.runDir,
+        startedAt: attempt.startedAt,
+        latestNote:
+          "Saved work recovered. Resume continues the same branches and artifacts.",
+      });
+      await this.addNote(
+        "info",
+        `Recovered ${attempt.attemptId}; it will resume from its saved run directory.`,
+        { problemKey: attempt.problemKey, attemptId: attempt.attemptId },
+      );
+      await this.store.event("campaign.legacy_boundary_attempt_restored", {
+        problemKey: attempt.problemKey,
+        attemptId: attempt.attemptId,
+        runDir: attempt.runDir,
+      });
+    }
+  }
+
   async reconcile() {
     migrateCampaignState(this.state, this.policy);
     for (const lease of await this.store.listLeases()) {
@@ -341,7 +452,12 @@ export class CampaignController {
         continue;
       }
       const childState = await readChildState(attempt.runDir);
-      if (childState && isChildTerminal(childState.status)) {
+      const pausedAttempt =
+        !attempt.projectedAt &&
+        ["paused", "deadline-reached", "budget-exhausted"].includes(
+          attempt.status,
+        );
+      if (childState && isChildTerminal(childState.status) && !pausedAttempt) {
         await this.projectFinishedAttempt(attempt, childState);
         continue;
       }
@@ -354,7 +470,9 @@ export class CampaignController {
         }
         continue;
       }
-      this.launchAttemptWorker(attempt, { resume: Boolean(childState) });
+      this.launchAttemptWorker(attempt, {
+        resume: Boolean(childState),
+      });
     }
     await this.store.saveCampaign(this.state);
   }
@@ -945,6 +1063,8 @@ export class CampaignController {
     const slot = this.slotForAttempt(attempt.attemptId);
     if (slot) slot.status = "running";
     attempt.status = "running";
+    attempt.pausedAt = null;
+    attempt.pauseReason = "";
     const promise = this.executeAttempt(attempt, { resume })
       .catch(async (error) => {
         attempt.status = "failed";
@@ -1007,12 +1127,26 @@ export class CampaignController {
         },
       };
       if (resume && (await fileExists(path.join(attempt.runDir, "run.json")))) {
+        const previousChildState = await readChildState(attempt.runDir);
+        const childDeadlineExpired =
+          previousChildState?.status === "deadline-reached" ||
+          (
+            previousChildState?.deadlineAt &&
+            Date.now() >= Date.parse(previousChildState.deadlineAt)
+          );
+        const childExtendHours = childDeadlineExpired
+          ? Math.min(
+              this.policy.problemHours,
+              this.remainingHours(),
+            )
+          : 0;
         app = await Autoprover.resume({
           config: childConfig,
           provider: attemptProvider,
           providerName: this.providerName,
           runDir: attempt.runDir,
-          extendHours: 0,
+          extendHours: childExtendHours,
+          reopenInterrupted: Boolean(attempt.pauseReason),
         });
       } else {
         app = await Autoprover.create({
@@ -1021,7 +1155,9 @@ export class CampaignController {
           providerName: this.providerName,
           runDir: attempt.runDir,
         });
-        await app.seedProblems([entry.packet], { vet: false });
+        await app.seedProblems([packetWithPriorResearch(entry)], {
+          vet: false,
+        });
       }
       await app.run();
       const childState = app.state;
@@ -1052,12 +1188,55 @@ export class CampaignController {
       return;
     }
     const summary = summarizeChildAttempt(attempt, childState);
+    const stopRequest = await this.store.readStopRequest();
     const interrupted =
       Boolean(attempt.switchRequestedAt) ||
-      Boolean(await this.store.readStopRequest()) ||
+      Boolean(stopRequest) ||
       !this.globalBudgetAvailable() ||
       this.deadlineReached() ||
       (this.state.stopRequestedByCandidate && this.policy.stopOnCandidate);
+    const pausedByCampaignBoundary =
+      !attempt.switchRequestedAt &&
+      !summary.hasCandidate &&
+      (
+        Boolean(stopRequest) ||
+        !this.globalBudgetAvailable() ||
+        this.deadlineReached() ||
+        (this.state.stopRequestedByCandidate && this.policy.stopOnCandidate)
+      );
+    if (pausedByCampaignBoundary) {
+      const pauseReason = stopRequest?.reason ||
+        (this.deadlineReached()
+          ? "Campaign deadline reached"
+          : !this.globalBudgetAvailable()
+            ? "Campaign call budget reached"
+            : "Campaign paused after another problem produced a candidate");
+      attempt.status = "paused";
+      attempt.pausedAt = nowIso();
+      attempt.pauseReason = pauseReason;
+      attempt.note = summary.note;
+      attempt.checkpoint = summary;
+      const slot = this.slotForAttempt(attempt.attemptId);
+      if (slot) {
+        slot.status = "paused";
+        slot.latestNote =
+          `Paused at a saved checkpoint: ${pauseReason}. Continue resumes this exact attempt.`;
+      }
+      await this.addNote(
+        "info",
+        `Paused “${childState.problems?.[0]?.packet?.title ?? attempt.problemKey}” at its saved checkpoint. Continue will resume the same branches and artifacts.`,
+        { problemKey: attempt.problemKey, attemptId: attempt.attemptId },
+      );
+      await this.store.event("campaign.attempt_paused", {
+        attemptId: attempt.attemptId,
+        problemKey: attempt.problemKey,
+        runDir: attempt.runDir,
+        pauseReason,
+        childStatus: childState.status,
+      });
+      await this.store.saveCampaign(this.state);
+      return;
+    }
     if (attempt.switchRequestedAt && !summary.hasCandidate) {
       summary.outcome = "interrupted";
       summary.note = `${summary.note} Switched out at an operator-requested checkpoint.`;
@@ -1504,6 +1683,9 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       const attemptHistory = (entry.attempts ?? []).map((attempt) => ({
         attemptId: attempt.attemptId,
         outcome: attempt.outcome,
+        problemStatus: attempt.problemStatus ?? null,
+        hasCandidate: Boolean(attempt.hasCandidate),
+        hasVerifiedPartial: Boolean(attempt.hasVerifiedPartial),
         startedAt: attempt.startedAt,
         completedAt: attempt.completedAt,
         activeWorkMs: attempt.activeWorkMs ?? 0,
@@ -1545,6 +1727,8 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         attemptCount: entry.attempts?.length ?? 0,
         lastOutcome: entry.attempts?.at(-1)?.outcome ?? null,
         attemptHistory,
+        lifecycle: entry.lifecycle ?? "eligible",
+        cooldownUntil: entry.cooldownUntil ?? null,
         totalActiveWorkMs: attemptHistory.reduce(
           (sum, attempt) => sum + attempt.activeWorkMs,
           0,
@@ -1583,6 +1767,13 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
     const attempt = campaign.attempts?.[slot.attemptId];
     const child = attempt ? await readChildState(attempt.runDir) : null;
     const problem = child?.problems?.[0];
+    const previousAttempts = [];
+    for (const previousAttempt of entry?.attempts ?? []) {
+      const previousChild = await readChildState(previousAttempt.runDir);
+      previousAttempts.push(
+        projectCompletedProblem(entry, previousAttempt, previousChild),
+      );
+    }
     const coordinatorNote =
       problem?.syntheses?.at(-1)?.portfolioSummary ||
       problem?.sharedState?.portfolioSummary ||
@@ -1610,10 +1801,22 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       attemptId: attempt?.attemptId ?? slot.attemptId,
       title: entry?.packet?.title ?? problem?.packet?.title ?? slot.problemKey,
       domain: entry?.packet?.domain ?? problem?.packet?.domain ?? "unknown",
-      status: problem?.status ?? attempt?.status ?? slot.status,
+      status:
+        slot.status === "paused"
+          ? "paused"
+          : problem?.status ?? attempt?.status ?? slot.status,
+      stage:
+        slot.status === "paused"
+          ? "paused at checkpoint"
+          : verificationRuns.length
+            ? "verifying a candidate"
+            : (problem?.branches?.length ?? 0) > 0
+              ? "researching approaches"
+              : "planning approaches",
       round: problem?.round ?? 0,
       activeWorkMs: problem?.activeWorkMs ?? 0,
       callsStarted: child?.budget?.callsStarted ?? 0,
+      pauseReason: attempt?.pauseReason ?? null,
       switchRequestedAt: attempt?.switchRequestedAt ?? null,
       coordinatorNote,
       statement: entry?.packet?.statement ?? problem?.packet?.statement ?? "",
@@ -1647,6 +1850,7 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       }),
       verification: verificationRuns,
       verificationRuns,
+      previousAttempts,
     });
     for (const branch of problem?.branches ?? []) {
       for (const delta of (branch.history ?? []).slice(-5)) {
@@ -1781,6 +1985,25 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         campaign.policy?.parallelProblems ??
         campaign.configSnapshot?.parallelProblems ??
         1,
+      maxConcurrentCalls:
+        campaign.policy?.maxConcurrentCalls ??
+        campaign.configSnapshot?.maxConcurrentCalls ??
+        1,
+      problemSlots: {
+        configured:
+          campaign.policy?.parallelProblems ??
+          campaign.configSnapshot?.parallelProblems ??
+          campaign.slots.length,
+        occupied: campaign.slots.filter((slot) => slot.status !== "idle").length,
+        running: campaign.slots.filter((slot) =>
+          ["starting", "running"].includes(slot.status),
+        ).length,
+        paused: campaign.slots.filter((slot) => slot.status === "paused").length,
+        awaitingManual: campaign.slots.filter(
+          (slot) => slot.status === "awaiting-manual",
+        ).length,
+        idle: campaign.slots.filter((slot) => slot.status === "idle").length,
+      },
       budget: {
         ...campaign.budget,
         maxCalls:
@@ -1798,7 +2021,16 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       queued: entries.filter((entry) =>
         isCampaignCandidateEligible(entry),
       ).length,
-      active: activeProblems.length,
+      active: campaign.slots.filter((slot) =>
+        ["starting", "running"].includes(slot.status),
+      ).length,
+      paused: campaign.slots.filter((slot) => slot.status === "paused").length,
+      cooldown: entries.filter(
+        (entry) => !slotByKey.has(entry.problemKey) && entry.lifecycle === "cooldown",
+      ).length,
+      finished: entries.filter((entry) =>
+        ["retired", "quarantined"].includes(entry.lifecycle),
+      ).length,
       candidates:
         candidates.length +
         activeProblems.reduce(
@@ -1845,6 +2077,24 @@ export function catalogProblemKey(problem) {
     )
     .sort();
   return sha256(JSON.stringify({ statement, assumptions }));
+}
+
+export function packetWithPriorResearch(entry) {
+  const priorResearch = (entry.attempts ?? []).slice(-4).map((attempt) => ({
+    outcome: attempt.outcome,
+    completedAt: attempt.completedAt,
+    report: attempt.note,
+    evidenceCount: attempt.evidenceCount ?? 0,
+    instruction:
+      "Treat this as untrusted saved research: verify before reuse and do not repeat a refuted path without a new representation or test.",
+  }));
+  return {
+    ...entry.packet,
+    priorResearch: [
+      ...(entry.packet.priorResearch ?? []),
+      ...priorResearch,
+    ],
+  };
 }
 
 export function deduplicateCatalogCandidates(entries) {

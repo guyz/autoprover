@@ -1,10 +1,17 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
   CampaignController,
+  packetWithPriorResearch,
   requestCampaignStop,
 } from "../src/campaign.mjs";
 import { loadConfig } from "../src/config.mjs";
@@ -36,6 +43,31 @@ function problem(index) {
     risks: [],
   };
 }
+
+test("a fresh retry receives compact prior research without local paths", () => {
+  const entry = {
+    packet: problem(1),
+    attempts: [
+      {
+        outcome: "progress-no-solution",
+        completedAt: "2026-07-23T19:13:29.888Z",
+        note: "Exact search ruled out all witnesses through size 24.",
+        evidenceCount: 47,
+        runDir: "/private/local/attempt",
+      },
+    ],
+  };
+
+  const packet = packetWithPriorResearch(entry);
+
+  assert.equal(packet.priorResearch.length, 1);
+  assert.equal(
+    packet.priorResearch[0].report,
+    "Exact search ruled out all witnesses through size 24.",
+  );
+  assert.match(packet.priorResearch[0].instruction, /verify before reuse/i);
+  assert.doesNotMatch(JSON.stringify(packet.priorResearch), /private\/local/);
+});
 
 function fixture(schemaName) {
   if (schemaName === "research_portfolio_plan") {
@@ -411,6 +443,185 @@ test(
     assert.deepEqual(setup.discoveryCycles, []);
     assert.equal(setup.provider.calls.length, 0);
     assert.equal(Object.keys(setup.controller.state.attempts).length, 0);
+  },
+);
+
+test(
+  "a campaign deadline pauses the exact child attempt and resume keeps its run directory",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-checkpoint-resume-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const setup = await campaignFixture(root, {
+      problems: [problem(1)],
+      parallelProblems: 1,
+    });
+    await setup.controller.mergeCatalogProblems([problem(1)], {
+      source: "checkpoint-test",
+      vetted: true,
+    });
+    const catalog = await setup.controller.store.loadCatalog();
+    const entry = Object.values(catalog.entries)[0];
+    const attempt = await setup.controller.startAttempt(
+      setup.controller.state.slots[0],
+      entry,
+    );
+    assert.ok(attempt);
+    await mkdir(attempt.runDir, { recursive: true });
+    const childState = {
+      status: "deadline-reached",
+      deadlineAt: new Date(Date.now() - 1_000).toISOString(),
+      stopReason: "Wall-clock deadline reached",
+      budget: { callsStarted: 3 },
+      problems: [
+        {
+          packet: entry.packet,
+          status: "deadline-reached",
+          stopReason: "Wall-clock deadline reached",
+          round: 1,
+          activeWorkMs: 60_000,
+          evidenceKeys: [],
+          branches: [],
+          verificationRuns: [],
+        },
+      ],
+    };
+    await writeFile(
+      path.join(attempt.runDir, "run.json"),
+      `${JSON.stringify(childState, null, 2)}\n`,
+      "utf8",
+    );
+    setup.controller.state.deadlineAt = new Date(
+      Date.now() - 1_000,
+    ).toISOString();
+
+    await setup.controller.projectFinishedAttempt(attempt, childState);
+
+    assert.equal(attempt.status, "paused");
+    assert.equal(attempt.projectedAt, null);
+    assert.equal(setup.controller.state.slots[0].status, "paused");
+    assert.equal(setup.controller.state.slots[0].attemptId, attempt.attemptId);
+    const pausedCatalog = await setup.controller.store.loadCatalog();
+    assert.equal(pausedCatalog.entries[entry.problemKey].attempts.length, 0);
+    assert.equal(
+      pausedCatalog.entries[entry.problemKey].lease.attemptId,
+      attempt.attemptId,
+    );
+
+    const resumed = await CampaignController.resume({
+      config: setup.config,
+      provider: new TrackingFixtureProvider(),
+      providerName: "max",
+      campaignDir: setup.campaignDir,
+      extendHours: 0.25,
+    });
+    const launches = [];
+    resumed.launchAttemptWorker = (candidate, options) => {
+      launches.push({ candidate, options });
+    };
+    await resumed.reconcile();
+
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].candidate.attemptId, attempt.attemptId);
+    assert.equal(launches[0].candidate.runDir, attempt.runDir);
+    assert.equal(launches[0].options.resume, true);
+  },
+);
+
+test(
+  "resume repairs an older controller's projected deadline attempt",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-legacy-resume-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const setup = await campaignFixture(root, {
+      problems: [problem(1)],
+      parallelProblems: 1,
+    });
+    await setup.controller.mergeCatalogProblems([problem(1)], {
+      source: "legacy-checkpoint-test",
+      vetted: true,
+    });
+    const catalog = await setup.controller.store.loadCatalog();
+    const entry = Object.values(catalog.entries)[0];
+    const attempt = await setup.controller.startAttempt(
+      setup.controller.state.slots[0],
+      entry,
+    );
+    await mkdir(attempt.runDir, { recursive: true });
+    await writeFile(
+      path.join(attempt.runDir, "run.json"),
+      `${JSON.stringify(
+        {
+          status: "deadline-reached",
+          deadlineAt: new Date(Date.now() - 1_000).toISOString(),
+          budget: { callsStarted: 3 },
+          problems: [
+            {
+              packet: entry.packet,
+              status: "deadline-reached",
+              branches: [],
+              verificationRuns: [],
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+    await setup.controller.store.releaseLease(
+      attempt.problemKey,
+      attempt.lease,
+    );
+    const completedAt = new Date(Date.now() - 500).toISOString();
+    await setup.controller.store.withCatalogLock(async (lockedCatalog) => {
+      const lockedEntry = lockedCatalog.entries[attempt.problemKey];
+      lockedEntry.attempts.push({
+        attemptId: attempt.attemptId,
+        outcome: "progress-no-solution",
+        completedAt,
+        hasCandidate: false,
+        childStatus: "deadline-reached",
+        note: "Saved useful work before the deadline.",
+      });
+      lockedEntry.lifecycle = "cooldown";
+      lockedEntry.cooldownUntil = new Date(Date.now() + 60_000).toISOString();
+    });
+    Object.assign(attempt, {
+      status: "completed",
+      completedAt,
+      projectedAt: completedAt,
+      outcome: "progress-no-solution",
+    });
+    Object.assign(setup.controller.state.slots[0], {
+      status: "idle",
+      problemKey: null,
+      attemptId: null,
+      runDir: null,
+      startedAt: null,
+      latestNote: "",
+    });
+
+    await setup.controller.restoreLegacyBoundaryAttempts();
+
+    assert.equal(attempt.status, "paused");
+    assert.equal(attempt.projectedAt, null);
+    assert.equal(attempt.runDir, setup.controller.state.slots[0].runDir);
+    assert.equal(setup.controller.state.slots[0].status, "paused");
+    const repairedCatalog = await setup.controller.store.loadCatalog();
+    assert.equal(
+      repairedCatalog.entries[attempt.problemKey].attempts.length,
+      0,
+    );
+    assert.equal(
+      repairedCatalog.entries[attempt.problemKey].lease.attemptId,
+      attempt.attemptId,
+    );
   },
 );
 

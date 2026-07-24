@@ -17,6 +17,13 @@ type Campaign = {
   cycle: number;
   provider: string;
   parallelProblems?: number;
+  maxConcurrentCalls?: number;
+  problemSlots?: {
+    configured?: number;
+    occupied?: number;
+    running?: number;
+    paused?: number;
+  };
   startedAt: string;
   deadlineAt: string;
   timeLeftMs: number;
@@ -26,6 +33,7 @@ type Campaign = {
     callsStarted: number;
     callsCompleted: number;
     callsFailed: number;
+    inFlight?: number;
     maxCalls: number;
     estimatedUsd?: number;
   };
@@ -35,6 +43,9 @@ type DashboardCounts = {
   catalog: number;
   queued: number;
   active: number;
+  paused?: number;
+  cooldown?: number;
+  finished?: number;
   candidates: number;
   reproduced: number;
 };
@@ -50,6 +61,9 @@ type CatalogAttempt = {
   evidenceCount: number;
   candidateKind?: string | null;
   note?: string;
+  problemStatus?: string;
+  hasCandidate?: boolean;
+  hasVerifiedPartial?: boolean;
 };
 
 type CatalogProblem = {
@@ -58,6 +72,8 @@ type CatalogProblem = {
   domain: string;
   rank: number;
   state: string;
+  lifecycle?: string;
+  cooldownUntil?: string | null;
   interest: number;
   solvability: number;
   priority: number;
@@ -122,6 +138,9 @@ type ActiveProblem = {
   title: string;
   domain: string;
   status: string;
+  stage?: string;
+  pauseReason?: string | null;
+  workerSlot?: string;
   round: number;
   activeWorkMs: number;
   callsStarted?: number;
@@ -578,24 +597,33 @@ function normalizeDashboard(input: unknown): DashboardData {
       : [];
   const processEvents: ResearchEvent[] = (
     raw.server?.recentProcessNotes ?? []
-  ).map((note, index) => ({
-    id: `controller-${note.at}-${index}`,
-    at: note.at,
-    level:
-      note.level === "error"
-        ? "error"
-        : note.level === "warning"
-          ? "warning"
-          : "diagnostic",
-    kind: "controller",
-    title:
-      note.level === "error"
-        ? "Controller process error"
-        : note.level === "warning"
-          ? "Controller process warning"
-          : "Controller process update",
-    note: note.message.trim(),
-  }));
+  ).map((note, index) => {
+    const message = note.message.trim();
+    const frontendDiagnostic =
+      message.includes("hydrated but some attributes") ||
+      message.includes("multiple renderers concurrently") ||
+      message.includes("MaxListenersExceededWarning");
+    return {
+      id: `controller-${note.at}-${index}`,
+      at: note.at,
+      level: frontendDiagnostic
+        ? "diagnostic"
+        : note.level === "error"
+          ? "error"
+          : note.level === "warning"
+            ? "warning"
+            : "diagnostic",
+      kind: "controller",
+      title: frontendDiagnostic
+        ? "Dashboard diagnostic"
+        : note.level === "error"
+          ? "Controller process error"
+          : note.level === "warning"
+            ? "Controller process warning"
+            : "Controller process update",
+      note: message,
+    };
+  });
   const events = [...researchEvents, ...processEvents].sort((left, right) =>
     right.at.localeCompare(left.at),
   );
@@ -684,6 +712,115 @@ function titleCase(value: string) {
     .replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+const FRIENDLY_STATUS: Record<string, string> = {
+  active: "Running",
+  attacking: "Running",
+  discovering: "Running",
+  planning: "Starting",
+  ranking: "Starting",
+  running: "Running",
+  starting: "Starting",
+  verifying: "Checking",
+  queued: "Waiting",
+  ready: "Waiting",
+  vetted: "Waiting",
+  cooldown: "Resting",
+  paused: "Paused",
+  stopped: "Paused",
+  stopping: "Pausing",
+  "deadline-reached": "Paused",
+  "budget-exhausted": "Paused",
+  candidate: "Candidate found",
+  "candidate-review": "Candidate review",
+  reproduced: "Verified",
+  retired: "Finished",
+  completed: "Finished",
+  "completed-no-result": "Finished",
+  "completed-with-candidate": "Candidate found",
+  interrupted: "Paused",
+  "progress-no-solution": "No final solution",
+  "no-result": "No final solution",
+  failed: "Attempt error",
+  saved: "Saved",
+};
+
+function friendlyStatus(status: string) {
+  return FRIENDLY_STATUS[status.toLowerCase()] ?? titleCase(status);
+}
+
+function attemptOutcome(attempt: CatalogAttempt) {
+  if (attempt.hasCandidate || attempt.candidateKind) return "Candidate found";
+  if (attempt.hasVerifiedPartial) return "Verified partial result";
+  const normalized = attempt.outcome.toLowerCase();
+  if (normalized === "progress-no-solution") {
+    return "No final solution · useful work saved";
+  }
+  if (normalized === "interrupted") return "Paused before completion";
+  if (normalized === "no-result") return "No final solution";
+  if (normalized.includes("failed") || normalized.includes("error")) {
+    return "Attempt error";
+  }
+  return friendlyStatus(attempt.outcome);
+}
+
+function problemStage(problem?: ActiveProblem) {
+  if (!problem) return "";
+  if (problem.status === "paused") return "Paused at a saved checkpoint";
+  const verification =
+    problem.verification ?? problem.verificationRuns ?? [];
+  if (verification.length) return "Checking a candidate";
+  if (!problem.branches.length) return "Planning approaches";
+  const moving = problem.branches.filter((branch) =>
+    ["running", "active", "verifying"].includes(branch.status),
+  ).length;
+  if (moving) {
+    return `Researching ${moving} approach${moving === 1 ? "" : "es"}`;
+  }
+  return problem.stage ? friendlyStatus(problem.stage) : "Attempt saved";
+}
+
+function problemStateLine(
+  problem: CatalogProblem,
+  activeProblem?: ActiveProblem,
+) {
+  if (activeProblem && ["active", "running", "verifying", "planning", "starting"].includes(activeProblem.status)) {
+    return problemStage(activeProblem);
+  }
+  const state = (problem.lifecycle ?? problem.state).toLowerCase();
+  if (state === "cooldown") {
+    const until = problem.cooldownUntil
+      ? ` until ${formatUtcTime(problem.cooldownUntil)}`
+      : "";
+    return `No final solution. Saved work is resting${until} before an automatic retry.`;
+  }
+  if (state === "paused") return "Paused at a saved checkpoint. Resume keeps this work.";
+  if (["queued", "ready", "vetted"].includes(state)) {
+    return "Waiting for an open problem slot.";
+  }
+  if (state === "retired") {
+    return "Finished after the allowed attempts; no verified solution.";
+  }
+  if (state.includes("candidate")) return "A candidate result is being checked.";
+  if (problem.lastOutcome) return `Last result: ${friendlyStatus(problem.lastOutcome)}.`;
+  return problem.selectionReason;
+}
+
+function inactiveProblemHeading(problem: CatalogProblem) {
+  const state = (problem.lifecycle ?? problem.state).toLowerCase();
+  if (state === "cooldown") return "No final solution yet";
+  if (state === "paused") return "Paused at a saved checkpoint";
+  if (state === "retired") return "Finished without a verified solution";
+  if (state.includes("candidate")) return "Candidate result under review";
+  return "Waiting for a problem slot";
+}
+
+function prioritizeLabel(problem: CatalogProblem) {
+  if (problem.operatorPinned) return "Scheduled next";
+  return (problem.lifecycle ?? problem.state) === "cooldown"
+    ? "Try again now"
+    : "Run next";
+}
+
 function formatDuration(milliseconds: number) {
   const safe = Math.max(0, milliseconds || 0);
   const totalMinutes = Math.floor(safe / 60_000);
@@ -741,7 +878,7 @@ function StatusChip({ status }: { status: string }) {
   return (
     <span className={`statusChip status-${statusTone(status)}`}>
       <span className="statusDot" aria-hidden="true" />
-      {titleCase(status)}
+      {friendlyStatus(status)}
     </span>
   );
 }
@@ -766,6 +903,45 @@ function KpiCard({
   );
 }
 
+function AttemptHistory({
+  attempts,
+  preserved = false,
+}: {
+  attempts: CatalogAttempt[];
+  preserved?: boolean;
+}) {
+  if (!attempts.length) return null;
+  return (
+    <section
+      className={`attemptHistory ${preserved ? "attemptHistoryPreserved" : ""}`}
+    >
+      <p className="sectionKicker">
+        {preserved ? "Earlier work is preserved" : "Saved attempt history"}
+      </p>
+      {preserved && (
+        <p className="historyExplanation">
+          The current run is continuing alongside these saved notes, facts, and
+          failed paths.
+        </p>
+      )}
+      <ol>
+        {attempts.map((attempt, index) => (
+          <li key={attempt.attemptId}>
+            <strong>
+              Attempt {index + 1} · {attemptOutcome(attempt)}
+            </strong>
+            <span>
+              {formatDuration(attempt.activeWorkMs)} worked ·{" "}
+              {attempt.callsStarted} calls · {attempt.rounds} rounds
+            </span>
+            {attempt.note && <small>{attempt.note}</small>}
+          </li>
+        ))}
+      </ol>
+    </section>
+  );
+}
+
 export default function AutoproverDashboard() {
   const [data, setData] = useState<DashboardData>(EMPTY_DATA);
   const [connection, setConnection] =
@@ -785,6 +961,16 @@ export default function AutoproverDashboard() {
   const [problemSuggestion, setProblemSuggestion] = useState("");
   const hasLiveData = useRef(false);
   const hydratedCampaignId = useRef("");
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      const savedProblem = window.localStorage.getItem(
+        "autoprover:selected-problem",
+      );
+      if (savedProblem) setSelectedId(savedProblem);
+    }, 0);
+    return () => window.clearTimeout(timeout);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -869,6 +1055,13 @@ export default function AutoproverDashboard() {
         activeProblem.status,
       ),
   );
+  const selectedProblemStage = selectedProblemIsRunning
+    ? problemStage(activeProblem)
+    : catalogProblem
+      ? inactiveProblemHeading(catalogProblem)
+      : activeProblem
+        ? "Saved attempt report"
+        : "Waiting";
   const verificationRuns =
     activeProblem?.verification ?? activeProblem?.verificationRuns ?? [];
   const visibleEvents = data.events.filter(
@@ -879,6 +1072,35 @@ export default function AutoproverDashboard() {
   const canResume = Boolean(
     data.campaign && RESUMABLE_CAMPAIGN_STATES.has(data.campaign.status),
   );
+  const configuredProblemSlots =
+    data.campaign?.problemSlots?.configured ??
+    data.campaign?.parallelProblems ??
+    settings.parallelProblems;
+  const runningProblems = data.counts.active;
+  const inFlightCalls =
+    data.campaign?.budget.inFlight ??
+    Math.max(
+      0,
+      (data.campaign?.budget.callsStarted ?? 0) -
+        (data.campaign?.budget.callsCompleted ?? 0) -
+        (data.campaign?.budget.callsFailed ?? 0),
+    );
+  const maxConcurrentCalls = data.campaign?.maxConcurrentCalls ?? 4;
+  const callsRemaining = data.campaign
+    ? Math.max(
+        0,
+        data.campaign.budget.maxCalls - data.campaign.budget.callsStarted,
+      )
+    : settings.maxCalls;
+  const resumedCallAllowance = data.campaign
+    ? Math.max(
+        0,
+        settings.maxCalls - data.campaign.budget.callsStarted,
+      )
+    : settings.maxCalls;
+  const restingProblems =
+    data.counts.cooldown ??
+    data.catalog.filter((problem) => problem.state === "cooldown").length;
   const callPercent = data.campaign?.budget.maxCalls
     ? Math.min(
         100,
@@ -893,6 +1115,11 @@ export default function AutoproverDashboard() {
   const nudgeCommandsInFlight = data.operatorCommands.filter((command) =>
     ["pending", "running"].includes(command.status),
   ).length;
+
+  function selectProblem(problemId: string) {
+    setSelectedId(problemId);
+    window.localStorage.setItem("autoprover:selected-problem", problemId);
+  }
 
   async function sendCommand(
     action: "start" | "stop" | "resume",
@@ -1166,6 +1393,7 @@ export default function AutoproverDashboard() {
               <span>Provider</span>
               <select
                 value={settings.provider}
+                disabled={Boolean(data.campaign)}
                 onChange={(event) =>
                   setSettings((current) => ({
                     ...current,
@@ -1181,9 +1409,10 @@ export default function AutoproverDashboard() {
               </select>
             </label>
             <label>
-              <span>Time limit</span>
+              <span>{canResume ? "Add time" : "Run for"}</span>
               <select
                 value={settings.hours}
+                disabled={isActive}
                 onChange={(event) =>
                   setSettings((current) => ({
                     ...current,
@@ -1198,13 +1427,17 @@ export default function AutoproverDashboard() {
               </select>
             </label>
             <label>
-              <span>Problems in parallel</span>
+              <span>Problem slots</span>
               <input
                 type="number"
-                min={1}
+                min={Math.max(
+                  1,
+                  data.campaign?.budget.callsStarted ?? 1,
+                )}
                 max={8}
                 inputMode="numeric"
                 value={settings.parallelProblems}
+                disabled={isActive}
                 onChange={(event) =>
                   setSettings((current) => ({
                     ...current,
@@ -1217,77 +1450,94 @@ export default function AutoproverDashboard() {
               />
             </label>
             <label>
-              <span>Maximum calls</span>
+              <span>Total call cap</span>
               <input
                 type="number"
                 min={1}
                 max={1000}
                 inputMode="numeric"
                 value={settings.maxCalls}
+                disabled={isActive}
                 onChange={(event) =>
                   setSettings((current) => ({
                     ...current,
-                    maxCalls: Math.max(1, Number(event.target.value) || 1),
+                    maxCalls: Math.max(
+                      data.campaign?.budget.callsStarted ?? 1,
+                      Number(event.target.value) || 1,
+                    ),
                   }))
                 }
               />
             </label>
             <div className="campaignActions" aria-label="Campaign actions">
-              <button
-                className="button buttonPrimary"
-                type="submit"
-                disabled={
-                  !commandsAvailable ||
-                  Boolean(data.campaign) ||
-                  isActive ||
-                  commandPending !== null
-                }
-                title={
-                  !commandsAvailable
-                    ? "Connect the authorized local controller to enable commands"
-                    : data.campaign
-                      ? "Use Continue to resume the existing campaign"
+              {!data.campaign && (
+                <button
+                  className="button buttonPrimary"
+                  type="submit"
+                  disabled={!commandsAvailable || commandPending !== null}
+                  title={
+                    !commandsAvailable
+                      ? "Connect the authorized local controller to enable commands"
                       : undefined
-                }
-              >
-                {commandPending === "start" ? "Starting…" : "Start"}
-              </button>
-              <button
-                className="button buttonDanger"
-                type="button"
-                disabled={
-                  !commandsAvailable ||
-                  !isActive ||
-                  isStopping ||
-                  commandPending !== null
-                }
-                onClick={() => void sendCommand("stop", { mode: "graceful" })}
-              >
-                {commandPending === "stop" || isStopping
-                  ? "Stopping safely…"
-                  : "Stop safely"}
-              </button>
-              <button
-                className="button buttonQuiet"
-                type="button"
-                disabled={
-                  !commandsAvailable || !canResume || commandPending !== null
-                }
-                onClick={() =>
-                  void sendCommand("resume", {
-                    extendHours: settings.hours,
-                    provider: settings.provider,
-                    parallelProblems: settings.parallelProblems,
-                    maxCalls: settings.maxCalls,
-                  })
-                }
-              >
-                {commandPending === "resume"
-                  ? "Resuming…"
-                  : `Continue +${settings.hours}h`}
-              </button>
+                  }
+                >
+                  {commandPending === "start"
+                    ? "Starting…"
+                    : "Start campaign"}
+                </button>
+              )}
+              {isActive && (
+                <button
+                  className="button buttonDanger"
+                  type="button"
+                  disabled={
+                    !commandsAvailable ||
+                    isStopping ||
+                    commandPending !== null
+                  }
+                  onClick={() =>
+                    void sendCommand("stop", { mode: "graceful" })
+                  }
+                >
+                  {commandPending === "stop" || isStopping
+                    ? "Saving checkpoints…"
+                    : "Pause after current calls"}
+                </button>
+              )}
+              {canResume && (
+                <button
+                  className="button buttonPrimary"
+                  type="button"
+                  disabled={
+                    !commandsAvailable ||
+                    commandPending !== null ||
+                    resumedCallAllowance === 0
+                  }
+                  onClick={() =>
+                    void sendCommand("resume", {
+                      extendHours: settings.hours,
+                      provider: settings.provider,
+                      parallelProblems: settings.parallelProblems,
+                      maxCalls: settings.maxCalls,
+                    })
+                  }
+                >
+                  {commandPending === "resume"
+                    ? "Resuming saved work…"
+                    : `Resume saved work for ${settings.hours}h`}
+                </button>
+              )}
             </div>
           </form>
+          <p className="controlExplanation">
+            {!data.campaign
+              ? "Starts one continuous campaign. Every problem, approach, and note is saved."
+              : isActive
+                ? `${runningProblems} of ${configuredProblemSlots} problem slots running · ${inFlightCalls} of ${maxConcurrentCalls} model calls in use. Pausing waits for current calls and keeps every checkpoint.`
+                : canResume
+                  ? `Your catalog and attempt history are preserved. Resuming adds time; the call cap is cumulative and ${resumedCallAllowance || callsRemaining} calls remain${resumedCallAllowance === 0 ? "—raise the total call cap to continue research" : ""}.`
+                  : "This campaign is saved. Its final state is shown below."}
+          </p>
           <div className="commandFeedback" aria-live="polite">
             {feedback}
           </div>
@@ -1372,34 +1622,34 @@ export default function AutoproverDashboard() {
         <main id="main-content">
           <section className="kpiGrid" aria-label="Campaign overview">
             <KpiCard
-              label="Problem catalog"
+              label="Catalog"
               value={data.counts.catalog}
-              detail="vetted and deduplicated"
+              detail="saved, vetted problems"
               accent="#3478aa"
             />
             <KpiCard
-              label="Up next"
-              value={data.counts.queued}
-              detail="ranked by expected value"
-              accent="#b07b27"
+              label="Running"
+              value={`${runningProblems}/${configuredProblemSlots}`}
+              detail={`${inFlightCalls}/${maxConcurrentCalls} model calls in use`}
+              accent="#14786f"
             />
             <KpiCard
-              label="Active"
-              value={data.counts.active}
-              detail={`${settings.parallelProblems} worker slots configured`}
-              accent="#14786f"
+              label="Waiting"
+              value={data.counts.queued}
+              detail="ranked for the next open slot"
+              accent="#6d7873"
+            />
+            <KpiCard
+              label="Resting"
+              value={restingProblems}
+              detail="saved after no final solution"
+              accent="#b07b27"
             />
             <KpiCard
               label="Candidates"
               value={data.counts.candidates}
-              detail="including verified partials"
+              detail="under independent checking"
               accent="#7656a6"
-            />
-            <KpiCard
-              label="Reproduced"
-              value={data.counts.reproduced}
-              detail="independent checks passed"
-              accent="#2f8053"
             />
           </section>
 
@@ -1407,16 +1657,14 @@ export default function AutoproverDashboard() {
             <section className="panel catalogPanel" aria-labelledby="queue-heading">
               <div className="panelHeader">
                 <div>
-                  <p className="sectionKicker">Live portfolio</p>
-                  <h2 id="queue-heading">Problem queue</h2>
+                  <p className="sectionKicker">All problems</p>
+                  <h2 id="queue-heading">Problems</h2>
                 </div>
-                <span className="rankHint">
-                  Expected value + verifier leverage
-                </span>
+                <span className="rankHint">Highest priority first</span>
               </div>
               <p className="panelIntro">
-                One lease per problem keeps parallel workers from duplicating
-                the same attack.
+                Select a problem to see its current stage, approaches, and saved
+                history.
               </p>
               <div className="nudgeBar" aria-label="Catalog nudges">
                 <button
@@ -1430,7 +1678,7 @@ export default function AutoproverDashboard() {
                   onClick={requestMoreProblems}
                   title="Runs another sourced and independently vetted discovery cycle"
                 >
-                  Find more
+                  Find more problems
                 </button>
                 <form className="suggestProblemForm" onSubmit={suggestProblem}>
                   <label className="srOnly" htmlFor="suggest-problem">
@@ -1470,13 +1718,16 @@ export default function AutoproverDashboard() {
                 <ol className="catalogList">
                   {data.catalog.map((problem) => {
                     const selected = problem.id === effectiveSelectedId;
+                    const liveProblem = data.activeProblems.find(
+                      (candidate) => candidate.id === problem.id,
+                    );
                     return (
                       <li key={problem.id}>
                         <button
                           type="button"
                           className={`catalogItem ${selected ? "catalogItemSelected" : ""}`}
                           aria-current={selected ? "true" : undefined}
-                          onClick={() => setSelectedId(problem.id)}
+                          onClick={() => selectProblem(problem.id)}
                         >
                           <span className="catalogRank" aria-label={`Rank ${problem.rank}`}>
                             {problem.rank}
@@ -1484,7 +1735,9 @@ export default function AutoproverDashboard() {
                           <span className="catalogBody">
                             <span className="catalogTopline">
                               <strong>{problem.title}</strong>
-                              <StatusChip status={problem.state} />
+                              <StatusChip
+                                status={problem.lifecycle ?? problem.state}
+                              />
                             </span>
                             <span className="catalogDomain">{problem.domain}</span>
                             <span className="catalogScores">
@@ -1519,8 +1772,8 @@ export default function AutoproverDashboard() {
                                   : ""}
                               </span>
                             )}
-                            <span className="selectionReason">
-                              {problem.selectionReason}
+                            <span className="problemStateLine">
+                              {problemStateLine(problem, liveProblem)}
                             </span>
                             {problem.workerSlot && (
                               <span className="workerLease">
@@ -1567,7 +1820,8 @@ export default function AutoproverDashboard() {
                   <div className="problemHeader">
                     <div>
                       <p className="sectionKicker">
-                        {activeProblem ? `Round ${activeProblem.round}` : "Queued"}
+                        Selected problem ·{" "}
+                        {selectedProblemStage}
                         {" · "}
                         {activeProblem?.domain ?? catalogProblem?.domain}
                       </p>
@@ -1577,7 +1831,12 @@ export default function AutoproverDashboard() {
                     </div>
                     <StatusChip
                       status={
-                        activeProblem?.status ?? catalogProblem?.state ?? "queued"
+                        selectedProblemIsRunning
+                          ? (activeProblem?.status ?? "running")
+                          : (catalogProblem?.lifecycle ??
+                            catalogProblem?.state ??
+                            activeProblem?.status ??
+                            "queued")
                       }
                     />
                   </div>
@@ -1621,12 +1880,14 @@ export default function AutoproverDashboard() {
                         </div>
                         <div>
                           <p className="sectionKicker">
-                            Portfolio coordinator
+                            {selectedProblemIsRunning
+                              ? "Current attempt"
+                              : "Saved attempt"}
                           </p>
                           <h3 id="coordinator-heading">
                             {selectedProblemIsRunning
-                              ? "What is happening now"
-                              : "Final attempt report"}
+                              ? problemStage(activeProblem)
+                              : "Where this attempt stopped"}
                           </h3>
                           <p>
                             {activeProblem.coordinatorNote ??
@@ -1652,7 +1913,7 @@ export default function AutoproverDashboard() {
                             >
                               {activeProblem.switchRequestedAt
                                 ? "Switch pending"
-                                : "Switch out"}
+                                : "Move to another problem"}
                             </button>
                           )}
                         </div>
@@ -1676,26 +1937,42 @@ export default function AutoproverDashboard() {
                         </details>
                       )}
 
+                      <AttemptHistory
+                        attempts={catalogProblem?.attemptHistory ?? []}
+                        preserved={selectedProblemIsRunning}
+                      />
+
                       <section
                         className="attemptsSection"
                         aria-labelledby="attempts-heading"
                       >
                         <div className="subsectionHeading">
                           <div>
-                            <p className="sectionKicker">Isolated workspaces</p>
-                            <h3 id="attempts-heading">Parallel attempts</h3>
+                            <p className="sectionKicker">
+                              {selectedProblemIsRunning
+                                ? "Current attempt"
+                                : "Saved work"}
+                            </p>
+                            <h3 id="attempts-heading">
+                              {selectedProblemIsRunning
+                                ? "Approaches for this problem"
+                                : "Approaches tried in this attempt"}
+                            </h3>
                           </div>
                           <span>
-                            {activeProblem.branches.filter((branch) =>
-                              ["running", "active", "verifying"].includes(
-                                branch.status,
-                              ),
-                            ).length}{" "}
-                            moving
+                            {selectedProblemIsRunning
+                              ? activeProblem.branches.filter((branch) =>
+                                  ["running", "active", "verifying"].includes(
+                                    branch.status,
+                                  ),
+                                ).length
+                              : activeProblem.branches.length}{" "}
+                            {selectedProblemIsRunning ? "active" : "recorded"}
                           </span>
                         </div>
-                        <div className="branchList">
-                          {activeProblem.branches.map((branch) => {
+                        {activeProblem.branches.length ? (
+                          <div className="branchList">
+                            {activeProblem.branches.map((branch) => {
                             const latest = branch.history?.at(-1);
                             return (
                               <details
@@ -1704,13 +1981,23 @@ export default function AutoproverDashboard() {
                               >
                                 <summary>
                                   <span
-                                    className={`branchRail status-${statusTone(branch.status)}`}
+                                    className={`branchRail status-${statusTone(
+                                      selectedProblemIsRunning
+                                        ? branch.status
+                                        : "saved",
+                                    )}`}
                                     aria-hidden="true"
                                   />
                                   <span className="branchSummaryMain">
                                     <span className="branchTitleRow">
                                       <strong>{branch.title}</strong>
-                                      <StatusChip status={branch.status} />
+                                      <StatusChip
+                                        status={
+                                          selectedProblemIsRunning
+                                            ? branch.status
+                                            : "saved"
+                                        }
+                                      />
                                     </span>
                                     <span className="branchMeta">
                                       Turn {branch.turn} · Round {branch.round}
@@ -1786,8 +2073,22 @@ export default function AutoproverDashboard() {
                                 </div>
                               </details>
                             );
-                          })}
-                        </div>
+                            })}
+                          </div>
+                        ) : (
+                          <div className="emptyState compact">
+                            <strong>
+                              {selectedProblemIsRunning
+                                ? "Planning distinct approaches."
+                                : "No branch details were recorded."}
+                            </strong>
+                            <span>
+                              {selectedProblemIsRunning
+                                ? "They will appear here after the coordinator creates isolated workspaces for this problem."
+                                : "The attempt summary above is the complete saved report."}
+                            </span>
+                          </div>
+                        )}
                       </section>
 
                       <section
@@ -1854,10 +2155,16 @@ export default function AutoproverDashboard() {
                     </>
                   ) : (
                     <div className="queuedDetail">
-                      <p className="sectionKicker">Selection rationale</p>
-                      <h3>Waiting for a worker slot</h3>
+                      <p className="sectionKicker">Current status</p>
+                      <h3>
+                        {catalogProblem
+                          ? inactiveProblemHeading(catalogProblem)
+                          : "Waiting for a problem slot"}
+                      </h3>
                       <p>
-                        {catalogProblem?.selectionReason ??
+                        {catalogProblem
+                          ? problemStateLine(catalogProblem)
+                          :
                           "This problem has passed vetting and is waiting in the ranked queue."}
                       </p>
                       {(catalogProblem?.counterexampleBonus ?? 0) > 0 &&
@@ -1880,12 +2187,13 @@ export default function AutoproverDashboard() {
                             }
                             onClick={prioritizeSelectedProblem}
                           >
-                            {catalogProblem.operatorPinned
-                              ? "Queued next"
-                              : "Run next"}
+                            {prioritizeLabel(catalogProblem)}
                           </button>
                           <span>
-                            Moves this problem ahead of the automatic ranking.
+                            {(catalogProblem.lifecycle ??
+                              catalogProblem.state) === "cooldown"
+                              ? "Skips the normal rest period and puts it back in line."
+                              : "Moves this problem ahead of the automatic ranking."}
                           </span>
                         </div>
                       )}
@@ -1894,31 +2202,9 @@ export default function AutoproverDashboard() {
                           Previous outcome: {catalogProblem.lastOutcome}
                         </p>
                       )}
-                      {(catalogProblem?.attemptHistory?.length ?? 0) > 0 && (
-                        <div className="attemptHistory">
-                          <p className="sectionKicker">Recorded attempts</p>
-                          <ol>
-                            {catalogProblem?.attemptHistory?.map(
-                              (attempt, index) => (
-                                <li key={attempt.attemptId}>
-                                  <strong>
-                                    Attempt {index + 1} ·{" "}
-                                    {titleCase(attempt.outcome)}
-                                  </strong>
-                                  <span>
-                                    {formatDuration(attempt.activeWorkMs)} worked ·{" "}
-                                    {attempt.callsStarted} calls · {attempt.rounds} rounds
-                                    {attempt.candidateKind
-                                      ? ` · ${titleCase(attempt.candidateKind)}`
-                                      : ""}
-                                  </span>
-                                  {attempt.note && <small>{attempt.note}</small>}
-                                </li>
-                              ),
-                            )}
-                          </ol>
-                        </div>
-                      )}
+                      <AttemptHistory
+                        attempts={catalogProblem?.attemptHistory ?? []}
+                      />
                     </div>
                   )}
                 </>

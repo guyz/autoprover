@@ -156,6 +156,9 @@ test("idle dashboard has a render-safe shape and exposes its per-process command
     queued: 0,
     active: 0,
     candidates: 0,
+    partialResults: 0,
+    unclassifiedClaims: 0,
+    rejectedClaims: 0,
     reproduced: 0,
   });
   assert.deepEqual(snapshot.catalog, []);

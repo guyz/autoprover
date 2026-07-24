@@ -45,11 +45,12 @@ test("server-renders the Autoprover problem dashboard", async () => {
 });
 
 test("keeps compact controls, problem states, and metadata wired", async () => {
-  const [component, page, layout, packageJson] = await Promise.all([
+  const [component, statusRules, page, layout, packageJson] = await Promise.all([
     readFile(
       new URL("../app/components/AutoproverDashboard.tsx", import.meta.url),
       "utf8",
     ),
+    readFile(new URL("../app/problem-status.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
@@ -59,9 +60,13 @@ test("keeps compact controls, problem states, and metadata wired", async () => {
   assert.match(component, /x-autoprover-command-token/);
   assert.match(component, /completedProblems/);
   assert.match(component, /recentProcessNotes/);
-  assert.match(component, /Checking a candidate now/);
-  assert.match(component, /Verification stopped at the budget/);
-  assert.match(component, /not accepted as a solution/);
+  assert.match(component, /Checking a partial result—not a solution/);
+  assert.match(component, /Checking a proposed proof or disproof/);
+  assert.match(component, /verified partial result/);
+  assert.match(component, /rejected claim/);
+  assert.match(component, /complete proof or disproof appears as Solved/);
+  assert.match(statusRules, /not accepted as a solution/);
+  assert.match(statusRules, /original problem remains open/);
   assert.match(component, /\/api\/catalog\/discover/);
   assert.match(component, /\/api\/catalog\/suggest/);
   assert.match(component, /\/api\/catalog\/prioritize/);

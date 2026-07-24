@@ -6,6 +6,15 @@ import {
   useRef,
   useState,
 } from "react";
+import {
+  activeVerificationScope,
+  isRejectedVerification,
+  isSolvedVerification,
+  verificationRunLabel,
+  verificationScope,
+  verificationSummary as summarizeVerification,
+  type VerificationRun,
+} from "../problem-status";
 
 type ConnectionState = "connecting" | "live" | "offline";
 
@@ -38,6 +47,9 @@ type DashboardCounts = {
   queued: number;
   active: number;
   candidates: number;
+  partialResults: number;
+  unclassifiedClaims: number;
+  rejectedClaims: number;
   reproduced: number;
 };
 
@@ -83,19 +95,6 @@ type Branch = {
   feedback?: string;
   verifiedFactsCount?: number;
   failedApproachesCount?: number;
-};
-
-type VerificationPass = {
-  pass: number;
-  verdict: string;
-  note: string;
-};
-
-type VerificationRun = {
-  candidateHash: string;
-  candidateClaim?: string;
-  status: string;
-  passes: VerificationPass[];
 };
 
 type ResearchProblem = {
@@ -168,8 +167,11 @@ type CampaignSettings = {
 
 type ProblemState =
   | "working"
-  | "verifying"
-  | "candidate"
+  | "checking-solution"
+  | "checking-partial"
+  | "checking-claim"
+  | "proposed-solution"
+  | "verified-partial"
   | "solved"
   | "no-solution"
   | "failed"
@@ -191,6 +193,9 @@ const EMPTY_DATA: DashboardData = {
     queued: 0,
     active: 0,
     candidates: 0,
+    partialResults: 0,
+    unclassifiedClaims: 0,
+    rejectedClaims: 0,
     reproduced: 0,
   },
   catalog: [],
@@ -239,23 +244,13 @@ const LIVE_PROBLEM_STATES = new Set([
   "starting",
 ]);
 
-const ACTIVE_VERIFICATION_STATES = new Set([
-  "checking",
-  "running",
-  "pending",
-  "verifying",
-]);
-
-const SOLVED_VERIFICATION_STATES = new Set([
-  "agent-reproduced-candidate",
-  "reproduced",
-  "verified",
-]);
-
 const PROBLEM_STATE_LABELS: Record<ProblemState, string> = {
   working: "Working",
-  verifying: "Verifying",
-  candidate: "Candidate",
+  "checking-solution": "Checking solution",
+  "checking-partial": "Checking partial",
+  "checking-claim": "Checking claim",
+  "proposed-solution": "Proposed solution",
+  "verified-partial": "Verified partial",
   solved: "Solved",
   "no-solution": "No solution yet",
   failed: "Failed",
@@ -264,14 +259,17 @@ const PROBLEM_STATE_LABELS: Record<ProblemState, string> = {
 };
 
 const PROBLEM_STATE_ORDER: Record<ProblemState, number> = {
-  verifying: 0,
-  candidate: 1,
-  working: 2,
-  solved: 3,
-  paused: 4,
-  "no-solution": 5,
-  failed: 6,
-  waiting: 7,
+  solved: 0,
+  "checking-solution": 1,
+  "checking-partial": 2,
+  "checking-claim": 3,
+  "proposed-solution": 4,
+  working: 5,
+  "verified-partial": 6,
+  paused: 7,
+  "no-solution": 8,
+  failed: 9,
+  waiting: 10,
 };
 
 function normalizeDashboard(input: unknown): DashboardData {
@@ -347,15 +345,39 @@ function normalizeDashboard(input: unknown): DashboardData {
       LIVE_PROBLEM_STATES.has(problem.status),
     ).length,
     candidates: activeProblems.reduce(
-      (sum, problem) => sum + verificationRuns(problem).length,
+      (sum, problem) =>
+        sum +
+        verificationRuns(problem).filter(
+          (run) => verificationScope(run) === "solution",
+        ).length,
+      0,
+    ),
+    partialResults: activeProblems.reduce(
+      (sum, problem) =>
+        sum +
+        verificationRuns(problem).filter(
+          (run) => verificationScope(run) === "partial",
+        ).length,
+      0,
+    ),
+    unclassifiedClaims: activeProblems.reduce(
+      (sum, problem) =>
+        sum +
+        verificationRuns(problem).filter(
+          (run) => verificationScope(run) === "claim",
+        ).length,
+      0,
+    ),
+    rejectedClaims: activeProblems.reduce(
+      (sum, problem) =>
+        sum +
+        verificationRuns(problem).filter(isRejectedVerification).length,
       0,
     ),
     reproduced: activeProblems.reduce(
       (sum, problem) =>
         sum +
-        verificationRuns(problem).filter((run) =>
-          SOLVED_VERIFICATION_STATES.has(run.status),
-        ).length,
+        verificationRuns(problem).filter(isSolvedVerification).length,
       0,
     ),
   };
@@ -427,34 +449,44 @@ function classifyProblem(
     ...verificationRuns(saved),
   ];
   if (
-    allVerification.some((run) =>
-      SOLVED_VERIFICATION_STATES.has(run.status),
-    ) ||
+    allVerification.some(isSolvedVerification) ||
     catalog.attemptHistory?.some(
       (attempt) =>
         attempt.hasCandidate &&
-        /reproduced|verified/i.test(attempt.candidateKind ?? ""),
+        ["proof", "disproof"].includes(attempt.candidateKind ?? "") &&
+        /reproduced/i.test(attempt.outcome),
     )
   ) {
     return "solved";
   }
-  if (
-    live &&
-    (live.status === "verifying" ||
-      verificationRuns(live).some((run) =>
-        ACTIVE_VERIFICATION_STATES.has(run.status),
-      ))
-  ) {
-    return "verifying";
+  if (live) {
+    const activeScope = activeVerificationScope(verificationRuns(live));
+    if (activeScope === "solution") return "checking-solution";
+    if (activeScope === "partial") return "checking-partial";
+    if (activeScope === "claim") return "checking-claim";
   }
   const lifecycle = (catalog.lifecycle ?? catalog.state).toLowerCase();
   if (
-    lifecycle.includes("candidate") ||
-    catalog.attemptHistory?.at(-1)?.hasCandidate
+    allVerification.some(
+      (run) =>
+        run.status === "candidate-needs-expert" &&
+        verificationScope(run) === "solution",
+    ) ||
+    catalog.attemptHistory?.some(
+      (attempt) =>
+        attempt.hasCandidate &&
+        ["proof", "disproof"].includes(attempt.candidateKind ?? ""),
+    )
   ) {
-    return "candidate";
+    return "proposed-solution";
   }
   if (live && LIVE_PROBLEM_STATES.has(live.status)) return "working";
+  if (
+    allVerification.some((run) => run.status === "verified-partial-lead") ||
+    catalog.attemptHistory?.some((attempt) => attempt.hasVerifiedPartial)
+  ) {
+    return "verified-partial";
+  }
   const latestOutcome =
     catalog.attemptHistory?.at(-1)?.outcome ?? catalog.lastOutcome ?? "";
   if (
@@ -490,9 +522,24 @@ function classifyProblem(
 
 function problemHeadline(view: ProblemView) {
   const { live, state } = view;
-  if (state === "verifying") return "Checking a candidate now";
-  if (state === "candidate") return "Candidate found; not verified yet";
-  if (state === "solved") return "Independently verified result";
+  if (state === "checking-solution") {
+    return "Checking a proposed proof or disproof";
+  }
+  if (state === "checking-partial") {
+    return "Checking a partial result—not a solution";
+  }
+  if (state === "checking-claim") {
+    return "Checking an unclassified research claim";
+  }
+  if (state === "proposed-solution") {
+    return "Proposed solution awaiting a final decision";
+  }
+  if (state === "verified-partial") {
+    return "Useful partial result; original problem remains open";
+  }
+  if (state === "solved") {
+    return "Complete proof or disproof independently reproduced";
+  }
   if (state === "working") {
     const count = live?.branches.length ?? 0;
     return count
@@ -514,44 +561,12 @@ function attemptOutcome(attempt: CatalogAttempt) {
   return titleCase(attempt.outcome);
 }
 
-function verificationLabel(status: string) {
-  if (SOLVED_VERIFICATION_STATES.has(status)) return "Verified";
-  if (ACTIVE_VERIFICATION_STATES.has(status)) return "In progress";
-  if (status === "inconclusive-budget-ended") return "Stopped at budget";
-  if (/reject|fail|refut/i.test(status)) return "Rejected";
-  if (/expert/i.test(status)) return "Needs expert review";
-  return titleCase(status);
-}
-
 function verificationSummary(view: ProblemView) {
   const runs = [
     ...verificationRuns(view.live),
     ...verificationRuns(view.saved),
   ];
-  if (!runs.length) return "";
-  if (
-    runs.some((run) => ACTIVE_VERIFICATION_STATES.has(run.status))
-  ) {
-    return "Verification is running now.";
-  }
-  if (
-    runs.some((run) => SOLVED_VERIFICATION_STATES.has(run.status))
-  ) {
-    return "Verification succeeded independently.";
-  }
-  const stopped = runs.find(
-    (run) => run.status === "inconclusive-budget-ended",
-  );
-  if (stopped) {
-    const passed = stopped.passes.filter(
-      (pass) => pass.verdict === "pass",
-    ).length;
-    return `Verification stopped at the budget · ${passed} check${passed === 1 ? "" : "s"} passed · not accepted as a solution.`;
-  }
-  if (runs.some((run) => /reject|fail|refut/i.test(run.status))) {
-    return "Verification rejected the candidate.";
-  }
-  return "A saved candidate has an unfinished verification record.";
+  return summarizeVerification(runs);
 }
 
 function latestProgress(view: ProblemView) {
@@ -680,14 +695,21 @@ function ProblemCard({
               {runs.map((run) => (
                 <article key={run.candidateHash}>
                   <div className="verificationTitle">
-                    <strong>{verificationLabel(run.status)}</strong>
+                    <strong>{verificationRunLabel(run)}</strong>
                     <code>{run.candidateHash.slice(0, 8)}</code>
                   </div>
-                  <p>{run.candidateClaim || "Saved candidate claim"}</p>
+                  <p>{run.candidateClaim || "Saved research claim"}</p>
+                  <p className="claimScope">
+                    {verificationScope(run) === "solution"
+                      ? "Claims to settle the full problem"
+                      : verificationScope(run) === "partial"
+                        ? "Partial result only · original problem remains open"
+                        : "Not classified as a full solution"}
+                  </p>
                   {run.status === "inconclusive-budget-ended" && (
                     <p className="verificationWarning">
-                      This did not solve the problem. A partial claim passed one
-                      check, but verification stopped before completion.
+                      This did not solve the problem. Verification stopped
+                      before completion.
                     </p>
                   )}
                   {run.passes.length > 0 && (
@@ -961,8 +983,11 @@ export default function AutoproverDashboard() {
     },
     {
       working: 0,
-      verifying: 0,
-      candidate: 0,
+      "checking-solution": 0,
+      "checking-partial": 0,
+      "checking-claim": 0,
+      "proposed-solution": 0,
+      "verified-partial": 0,
       solved: 0,
       "no-solution": 0,
       failed: 0,
@@ -970,7 +995,21 @@ export default function AutoproverDashboard() {
       waiting: 0,
     } satisfies Record<ProblemState, number>,
   );
-  const workingNow = stateCounts.working + stateCounts.verifying;
+  const workingNow =
+    stateCounts.working +
+    stateCounts["checking-solution"] +
+    stateCounts["checking-partial"] +
+    stateCounts["checking-claim"];
+  const allVerificationRuns = problemViews.flatMap((view) => [
+    ...verificationRuns(view.live),
+    ...verificationRuns(view.saved),
+  ]);
+  const rejectedClaimCount = allVerificationRuns.filter(
+    isRejectedVerification,
+  ).length;
+  const verifiedPartialCount = allVerificationRuns.filter(
+    (run) => run.status === "verified-partial-lead",
+  ).length;
 
   async function sendCommand(
     action: "start" | "stop" | "resume",
@@ -1534,10 +1573,32 @@ export default function AutoproverDashboard() {
               <div>
                 <h2>Problems</h2>
                 <p>
-                  {workingNow} working · {stateCounts.verifying} verifying ·{" "}
-                  {stateCounts.solved} solved · {stateCounts.paused} saved ·{" "}
-                  {stateCounts["no-solution"]} no solution yet
+                  {workingNow} active ·{" "}
+                  {stateCounts["checking-partial"]} partial check
+                  {stateCounts["checking-partial"] === 1 ? "" : "s"} ·{" "}
+                  {stateCounts["checking-solution"]} solution check
+                  {stateCounts["checking-solution"] === 1 ? "" : "s"} ·{" "}
+                  {stateCounts.solved} solved
                 </p>
+                {(verifiedPartialCount > 0 || rejectedClaimCount > 0) && (
+                  <p className="problemSecondaryCounts">
+                    {verifiedPartialCount > 0 && (
+                      <>
+                        {verifiedPartialCount} verified partial result
+                        {verifiedPartialCount === 1 ? "" : "s"}
+                      </>
+                    )}
+                    {verifiedPartialCount > 0 && rejectedClaimCount > 0
+                      ? " · "
+                      : ""}
+                    {rejectedClaimCount > 0 && (
+                      <>
+                        {rejectedClaimCount} rejected claim
+                        {rejectedClaimCount === 1 ? "" : "s"}
+                      </>
+                    )}
+                  </p>
+                )}
               </div>
               <details className="manageProblems">
                 <summary>Manage list</summary>
@@ -1640,7 +1701,8 @@ export default function AutoproverDashboard() {
         </main>
 
         <footer>
-          Candidates are not marked solved until independently reproduced.
+          “Partial check” is not a solution. Only an independently reproduced
+          complete proof or disproof appears as Solved.
         </footer>
       </div>
     </>

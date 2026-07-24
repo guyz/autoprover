@@ -49,6 +49,7 @@ test("campaign accepts persistent-loop controls and rejects unknown flags", () =
         hours: "24",
         "parallel-problems": "3",
         "max-cycles": "0",
+        continuous: true,
       },
       [],
     ),

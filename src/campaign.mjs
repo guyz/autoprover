@@ -28,6 +28,7 @@ import {
 import { counterexampleOpportunity } from "./falsification.mjs";
 
 const HOUR_MS = 60 * 60 * 1_000;
+const CONTINUOUS_CHILD_MAX_CALLS = Number.MAX_SAFE_INTEGER;
 const ACTIVE_CHILD_STATUSES = new Set([
   "created",
   "discovering",
@@ -57,6 +58,7 @@ export class CampaignController {
     this.activeWorkers = new Map();
     this.refreshPromise = null;
     this.operatorDiscoveryPromise = null;
+    this.continuousBudgetRefillPromise = null;
     this.globalCallSemaphore = new Semaphore(
       isApiBilledProvider(this.providerName)
         ? 1
@@ -189,12 +191,23 @@ export class CampaignController {
     try {
       if (this.resumeOptions) {
         const extendHours = this.resumeOptions.extendHours ?? 0;
-        if (extendHours > 0) {
+        if (
+          Number.isFinite(this.state.pausedRemainingMs) &&
+          this.state.pausedRemainingMs >= 0
+        ) {
+          this.state.deadlineAt = new Date(
+            Date.now() +
+              this.state.pausedRemainingMs +
+              extendHours * HOUR_MS,
+          ).toISOString();
+        } else if (extendHours > 0) {
           this.state.deadlineAt = new Date(
             Math.max(Date.now(), Date.parse(this.state.deadlineAt)) +
               extendHours * HOUR_MS,
           ).toISOString();
         }
+        this.state.pausedAt = null;
+        this.state.pausedRemainingMs = null;
         await this.store.clearStopRequest();
         if (
           [
@@ -1187,12 +1200,18 @@ export class CampaignController {
       await this.releaseAttemptSlot(attempt);
       return;
     }
+    // A subscription-backed continuous campaign treats maxCalls as a durable
+    // renewal batch, not as a stop boundary. Renew before deciding whether the
+    // child was interrupted so an attempt that ends exactly on the boundary is
+    // projected normally and its slot can keep moving.
+    await this.ensureContinuousCallBudget();
     const summary = summarizeChildAttempt(attempt, childState);
     const stopRequest = await this.store.readStopRequest();
+    const callOrCostBudgetExhausted = !this.globalBudgetAvailable();
     const interrupted =
       Boolean(attempt.switchRequestedAt) ||
       Boolean(stopRequest) ||
-      !this.globalBudgetAvailable() ||
+      callOrCostBudgetExhausted ||
       this.deadlineReached() ||
       (this.state.stopRequestedByCandidate && this.policy.stopOnCandidate);
     const pausedByCampaignBoundary =
@@ -1200,7 +1219,7 @@ export class CampaignController {
       !summary.hasCandidate &&
       (
         Boolean(stopRequest) ||
-        !this.globalBudgetAvailable() ||
+        callOrCostBudgetExhausted ||
         this.deadlineReached() ||
         (this.state.stopRequestedByCandidate && this.policy.stopOnCandidate)
       );
@@ -1208,7 +1227,7 @@ export class CampaignController {
       const pauseReason = stopRequest?.reason ||
         (this.deadlineReached()
           ? "Campaign deadline reached"
-          : !this.globalBudgetAvailable()
+          : callOrCostBudgetExhausted
             ? "Campaign call budget reached"
             : "Campaign paused after another problem produced a candidate");
       attempt.status = "paused";
@@ -1421,6 +1440,7 @@ export class CampaignController {
         stopRequest?.reason || "Campaign stop requested",
       );
     }
+    await this.ensureContinuousCallBudget();
     if (!this.globalBudgetAvailable() || this.deadlineReached()) {
       throw new CampaignBudgetExhaustedError(
         `Campaign budget or deadline exhausted before ${role ?? "model"} call`,
@@ -1453,17 +1473,70 @@ export class CampaignController {
   canStartWork() {
     return (
       !this.deadlineReached() &&
-      this.globalBudgetAvailable() &&
+      (
+        this.globalBudgetAvailable() ||
+        this.canRefillContinuousCallBudget()
+      ) &&
       this.state.status !== "stopping"
     );
   }
 
   globalBudgetAvailable() {
     return (
-      this.state.budget.callsStarted < this.policy.maxCalls &&
+      this.callBudgetAvailable() &&
       (!isApiBilledProvider(this.providerName) ||
         this.state.budget.estimatedUsd < this.policy.maxEstimatedUsd)
     );
+  }
+
+  callBudgetAvailable() {
+    return this.state.budget.callsStarted < this.policy.maxCalls;
+  }
+
+  canRefillContinuousCallBudget() {
+    return (
+      this.policy.continuous === true &&
+      !isApiBilledProvider(this.providerName) &&
+      !this.deadlineReached() &&
+      !["stopping", "stopped"].includes(this.state.status)
+    );
+  }
+
+  async ensureContinuousCallBudget() {
+    if (this.callBudgetAvailable()) return false;
+    if (!this.canRefillContinuousCallBudget()) return false;
+    if (this.continuousBudgetRefillPromise) {
+      return this.continuousBudgetRefillPromise;
+    }
+    this.continuousBudgetRefillPromise = (async () => {
+      if (this.callBudgetAvailable()) return false;
+      const previousLimit = this.policy.maxCalls;
+      const batch = Math.max(
+        this.policy.callBudgetBatch,
+        this.policy.maxConcurrentCalls,
+      );
+      const nextLimit = Math.max(
+        previousLimit + batch,
+        this.state.budget.callsStarted + batch,
+      );
+      this.policy.maxCalls = nextLimit;
+      this.state.policy.maxCalls = nextLimit;
+      this.state.configSnapshot.maxCalls = nextLimit;
+      await this.addNote(
+        "info",
+        `Continuous run renewed its call allowance from ${previousLimit} to ${nextLimit}; the wall-clock deadline is unchanged.`,
+      );
+      await this.store.event("campaign.call_budget_renewed", {
+        previousLimit,
+        nextLimit,
+        callsStarted: this.state.budget.callsStarted,
+        deadlineAt: this.state.deadlineAt,
+      });
+      return true;
+    })().finally(() => {
+      this.continuousBudgetRefillPromise = null;
+    });
+    return this.continuousBudgetRefillPromise;
   }
 
   deadlineReached() {
@@ -1514,7 +1587,12 @@ export class CampaignController {
       provider: this.providerName,
       wallClockHours: Math.max(1 / 60, wallClockHours),
       parallelProblems: 1,
-      maxCalls: this.policy.maxCalls,
+      // The campaign owns the shared call gate. Continuous subscription runs
+      // must not also inherit a per-child copy of the renewal-batch boundary,
+      // or every problem would stop independently at that arbitrary number.
+      maxCalls: this.canRefillContinuousCallBudget()
+        ? CONTINUOUS_CHILD_MAX_CALLS
+        : this.policy.maxCalls,
       maxEstimatedUsd: this.policy.maxEstimatedUsd,
     };
   }
@@ -1537,6 +1615,7 @@ export class CampaignController {
       this.state.stopReason = "Campaign wall-clock deadline reached";
       return true;
     }
+    await this.ensureContinuousCallBudget();
     if (!this.globalBudgetAvailable()) {
       this.state.status = "budget-exhausted";
       this.state.stopReason = "Campaign call or estimated API-cost budget exhausted";
@@ -1564,6 +1643,16 @@ export class CampaignController {
       this.state.status = hasCandidate ? "completed-with-candidate" : "completed";
     }
     if (!this.state.stopReason) this.state.stopReason = "Campaign finished";
+    if (
+      this.state.status !== "deadline-reached" &&
+      Date.parse(this.state.deadlineAt) > Date.now()
+    ) {
+      this.state.pausedAt = nowIso();
+      this.state.pausedRemainingMs = Math.max(
+        0,
+        Date.parse(this.state.deadlineAt) - Date.now(),
+      );
+    }
     await this.addNote("result", this.state.stopReason);
     await this.store.event("campaign.finished", {
       status: this.state.status,
@@ -1960,7 +2049,11 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         attempt.problemStatus === "candidate-complete-agent-reproduced",
     ),
   );
-  const timeLeftMs = Math.max(0, Date.parse(campaign.deadlineAt) - Date.now());
+  const timeLeftMs =
+    Number.isFinite(campaign.pausedRemainingMs) &&
+    campaign.pausedRemainingMs >= 0
+      ? campaign.pausedRemainingMs
+      : Math.max(0, Date.parse(campaign.deadlineAt) - Date.now());
   const snapshot = {
     schemaVersion: 1,
     generatedAt: nowIso(),
@@ -1974,6 +2067,7 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       updatedAt: campaign.updatedAt,
       deadlineAt: campaign.deadlineAt,
       timeLeftMs,
+      pausedAt: campaign.pausedAt ?? null,
       stopRequestedAt:
         campaign.status === "stopping" || campaign.status === "stopped"
           ? latestNote?.at ?? null
@@ -1981,6 +2075,7 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       latestNote: latestNote?.message ?? campaign.stopReason ?? "",
       stopReason: campaign.stopReason,
       cycle: campaign.cycle,
+      continuous: campaign.policy?.continuous === true,
       parallelProblems:
         campaign.policy?.parallelProblems ??
         campaign.configSnapshot?.parallelProblems ??
@@ -2006,6 +2101,11 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       },
       budget: {
         ...campaign.budget,
+        callBudgetBatch:
+          campaign.policy?.callBudgetBatch ??
+          campaign.policy?.maxCalls ??
+          campaign.configSnapshot?.maxCalls ??
+          0,
         maxCalls:
           campaign.policy?.maxCalls ??
           campaign.configSnapshot?.maxCalls ??
@@ -2258,6 +2358,10 @@ function resolveCampaignPolicy(config, override) {
     override.parallelProblems ?? config.parallelProblems,
     "parallelProblems",
   );
+  const maxCalls = positiveInteger(
+    override.maxCalls ?? config.maxCalls,
+    "maxCalls",
+  );
   return {
     durationHours: positiveNumber(
       override.durationHours ?? config.wallClockHours,
@@ -2272,10 +2376,12 @@ function resolveCampaignPolicy(config, override) {
       override.maxConcurrentCalls ?? config.maxConcurrentCalls,
       "maxConcurrentCalls",
     ),
-    maxCalls: positiveInteger(
-      override.maxCalls ?? config.maxCalls,
-      "maxCalls",
+    maxCalls,
+    callBudgetBatch: positiveInteger(
+      override.callBudgetBatch ?? maxCalls,
+      "callBudgetBatch",
     ),
+    continuous: override.continuous === true,
     maxEstimatedUsd: nonNegativeNumber(
       override.maxEstimatedUsd ?? config.maxEstimatedUsd,
       "maxEstimatedUsd",

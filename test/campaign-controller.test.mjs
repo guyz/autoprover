@@ -285,6 +285,8 @@ test(
     assert.deepEqual(setup.discoveryCycles, [1]);
     assert.equal(snapshot.counts.catalog, 3);
     assert.equal(snapshot.counts.candidates, 3);
+    assert.equal(snapshot.counts.partialResults, 0);
+    assert.equal(snapshot.counts.unclassifiedClaims, 0);
     assert.equal(snapshot.counts.active, 0);
     assert.equal(snapshot.completedProblems.length, 3);
     assert.ok(
@@ -292,6 +294,7 @@ test(
         (entry) =>
           entry.branches.length === 1 &&
           entry.verification.length === 1 &&
+          entry.verification[0].candidateKind === "disproof" &&
           entry.coordinatorNote,
       ),
       "completed problems retain their final branch, verification, and coordinator detail",

@@ -1873,6 +1873,7 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       (run) => ({
         candidateHash: run.candidateHash,
         candidateClaim: run.candidate?.claim ?? "",
+        candidateKind: run.candidate?.kind ?? null,
         status: run.status,
         passes: (run.passes ?? []).map((pass, index) => ({
           pass: index + 1,
@@ -1884,6 +1885,15 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
             "",
         })),
       }),
+    );
+    const activeVerificationRuns = verificationRuns.filter((run) =>
+      ["checking", "running", "pending", "verifying"].includes(run.status),
+    );
+    const activeSolutionCheck = activeVerificationRuns.some((run) =>
+      ["proof", "disproof"].includes(run.candidateKind),
+    );
+    const activePartialCheck = activeVerificationRuns.some(
+      (run) => run.candidateKind === "partial",
     );
     activeProblems.push({
       id: slot.problemKey,
@@ -1897,8 +1907,12 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       stage:
         slot.status === "paused"
           ? "paused at checkpoint"
-          : verificationRuns.length
-            ? "verifying a candidate"
+          : activeSolutionCheck
+            ? "checking a proposed solution"
+            : activePartialCheck
+              ? "checking a partial result"
+              : activeVerificationRuns.length
+                ? "checking an unclassified research claim"
             : (problem?.branches?.length ?? 0) > 0
               ? "researching approaches"
               : "planning approaches",
@@ -2040,8 +2054,23 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
   const events = [...eventNotes, ...childEvents]
     .sort((left, right) => String(left.at).localeCompare(String(right.at)))
     .slice(-200);
-  const candidates = entries.filter(
+  const candidateEntries = entries.filter(
     (entry) => entry.lifecycle === "candidate-review",
+  );
+  const activeVerificationRuns = activeProblems.flatMap(
+    (problem) => problem.verification ?? [],
+  );
+  const activeSolutionCandidates = activeVerificationRuns.filter((run) =>
+    ["proof", "disproof"].includes(run.candidateKind),
+  );
+  const partialResults = activeVerificationRuns.filter(
+    (run) => run.candidateKind === "partial",
+  );
+  const unclassifiedClaims = activeVerificationRuns.filter(
+    (run) => !["proof", "disproof", "partial"].includes(run.candidateKind),
+  );
+  const rejectedClaims = activeVerificationRuns.filter((run) =>
+    /reject|fail|refut/i.test(run.status),
   );
   const reproduced = entries.filter((entry) =>
     entry.attempts?.some(
@@ -2131,12 +2160,10 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       finished: entries.filter((entry) =>
         ["retired", "quarantined"].includes(entry.lifecycle),
       ).length,
-      candidates:
-        candidates.length +
-        activeProblems.reduce(
-          (sum, problem) => sum + (problem.verification?.length ?? 0),
-          0,
-        ),
+      candidates: candidateEntries.length + activeSolutionCandidates.length,
+      partialResults: partialResults.length,
+      unclassifiedClaims: unclassifiedClaims.length,
+      rejectedClaims: rejectedClaims.length,
       reproduced: reproduced.length,
     },
     catalog: catalogItems,
@@ -2707,6 +2734,7 @@ function projectCompletedProblem(entry, attempt, child) {
   const verificationRuns = (problem?.verificationRuns ?? []).map((run) => ({
     candidateHash: run.candidateHash,
     candidateClaim: run.candidate?.claim ?? "",
+    candidateKind: run.candidate?.kind ?? null,
     status: run.status,
     passes: (run.passes ?? []).map((pass, index) => ({
       pass: index + 1,

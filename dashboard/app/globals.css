@@ -478,6 +478,11 @@ a {
   font-size: 0.7rem;
 }
 
+.problemsHeader .problemSecondaryCounts {
+  color: var(--subtle);
+  font-size: 0.63rem;
+}
+
 .manageProblems {
   position: relative;
 }
@@ -581,16 +586,29 @@ a {
   color: var(--teal-dark);
 }
 
-.problemStatus-verifying {
+.problemStatus-checking-solution {
   border-color: #b9b1d6;
   background: var(--purple-soft);
   color: #5f468e;
 }
 
-.problemStatus-candidate {
+.problemStatus-checking-partial,
+.problemStatus-checking-claim {
+  border-color: #d6c49c;
+  background: var(--gold-soft);
+  color: #76500f;
+}
+
+.problemStatus-proposed-solution {
   border-color: #c6b0df;
   background: #f1eafa;
   color: var(--purple);
+}
+
+.problemStatus-verified-partial {
+  border-color: #a8d0c9;
+  background: var(--teal-soft);
+  color: var(--teal-dark);
 }
 
 .problemStatus-solved {
@@ -795,6 +813,12 @@ a {
 
 .verificationList article > p {
   margin: 0.4rem 0 0;
+}
+
+.verificationList .claimScope {
+  color: var(--subtle);
+  font-size: 0.61rem;
+  font-weight: 700;
 }
 
 .verificationList .verificationWarning {

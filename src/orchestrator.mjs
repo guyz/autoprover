@@ -37,6 +37,12 @@ import {
   counterexampleOpportunity,
   resolveFalsificationProfile,
 } from "./falsification.mjs";
+import {
+  discoveryDiversityBrief,
+  priorStrategyCoverage,
+  selectDiverseStrategies,
+  selectProblemPortfolio,
+} from "./diversity.mjs";
 
 export class Autoprover {
   constructor({ config, provider, providerName, store, state, lockHeld = false }) {
@@ -63,6 +69,9 @@ export class Autoprover {
       startedAt,
       updatedAt: startedAt,
       deadlineAt,
+      selectionSeed: sha256(
+        `${path.basename(runDir)}:${startedAt}:${shortId()}`,
+      ),
       configSnapshot: config,
       budget: {
         callsStarted: 0,
@@ -180,7 +189,12 @@ export class Autoprover {
     const scout = await this.callModel({
       operationKey: "discovery:scout",
       role: "scout",
-      prompt: discoveryPrompt(this.config, currentDate),
+      prompt: discoveryPrompt(this.config, currentDate, {
+        diversityBrief: discoveryDiversityBrief(
+          this.state.selectionSeed,
+          this.config.discovery.poolSize,
+        ),
+      }),
       schema: DISCOVERY_SCHEMA,
       workingDir: scoutWorkspace,
       tools: { webSearch: true, codeInterpreter: false },
@@ -195,12 +209,19 @@ export class Autoprover {
     const eligible = rawProblems
       .filter((problem) => problem.interest >= this.config.discovery.minimumInterest)
       .filter((problem) => problem.tractability >= this.config.discovery.minimumTractability)
-      .filter((problem) => problem.verifiability >= this.config.discovery.minimumVerifiability)
-      .sort((a, b) => problemScore(b) - problemScore(a));
+      .filter((problem) => problem.verifiability >= this.config.discovery.minimumVerifiability);
 
     const vetCount = Math.min(eligible.length, Math.max(this.config.discovery.attackCount * 2, this.config.discovery.attackCount));
+    const vetCandidates = selectProblemPortfolio(
+      eligible.map(discoverySelectionEntry),
+      {
+        count: vetCount,
+        seed: this.state.selectionSeed,
+        cycle: "discovery-vetting",
+      },
+    ).map((entry) => entry.packet);
     const vetSettled = await Promise.allSettled(
-      eligible.slice(0, vetCount).map((problem) =>
+      vetCandidates.map((problem) =>
         this.callSemaphore.use(async () => {
           const workspace = path.join(this.store.runDir, "discovery", "vet", slugify(problem.id));
           await mkdir(workspace, { recursive: true });
@@ -240,12 +261,21 @@ export class Autoprover {
       validateProblemPacket(problem);
     }
 
-    const selected = selectDiverse(
-      vetted.filter((problem) => problem.vetting?.recommendation === "attack"),
-      this.config.discovery.attackCount,
+    const selectedEntries = selectProblemPortfolio(
+      vetted
+        .filter((problem) => problem.vetting?.recommendation === "attack")
+        .map(discoverySelectionEntry),
+      {
+        count: this.config.discovery.attackCount,
+        seed: this.state.selectionSeed,
+        cycle: "discovery-attack",
+      },
     );
+    const selected = selectedEntries.map((entry) => entry.packet);
     if (!selected.length) {
-      throw new Error("Discovery produced no problem whose exact statement and open status passed independent vetting");
+      throw new Error(
+        "Discovery produced no problem whose exact statement, open status, source quality, and substantive human study passed independent vetting",
+      );
     }
 
     this.state.discovery = {
@@ -254,6 +284,11 @@ export class Autoprover {
       eligibleCount: eligible.length,
       vetted,
       selectedIds: selected.map((problem) => problem.id),
+      automaticSelection: selectedEntries.map((entry) => ({
+        problemId: entry.packet.id,
+        problemKey: entry.problemKey,
+        ...entry.selection,
+      })),
     };
     this.state.problems = selected.map(createProblemState);
     this.state.status = "ready";
@@ -417,17 +452,44 @@ export class Autoprover {
     await mkdir(problemDir, { recursive: true });
 
     if (!problemState.plan) {
+      const proposalCount = Math.max(
+        this.config.branchesPerProblem,
+        Math.min(
+          18,
+          Math.max(
+            this.config.branchesPerProblem * 3,
+            this.config.branchesPerProblem + 4,
+          ),
+        ),
+      );
       const planResult = await this.callModel({
         operationKey: `problem:${problemState.packet.id}:plan`,
         role: "planner",
-        prompt: planPrompt(problemState.packet, this.config.branchesPerProblem),
+        prompt: planPrompt(
+          problemState.packet,
+          proposalCount,
+          this.config.branchesPerProblem,
+        ),
         schema: PLAN_SCHEMA,
         workingDir: path.join(problemDir, "planner"),
         tools: { webSearch: true, codeInterpreter: true },
       });
-      const strategies = planResult.data.strategies.slice(0, this.config.branchesPerProblem);
+      const strategySelection = selectDiverseStrategies(
+        planResult.data.strategies,
+        {
+          count: this.config.branchesPerProblem,
+          seed:
+            `${this.state.selectionSeed}:` +
+            `${problemState.packet.statementHash}:initial-plan`,
+          priorCoverage: priorStrategyCoverage(problemState.packet),
+        },
+      );
+      const strategies = strategySelection.strategies;
       if (!strategies.length) throw new Error(`Planner returned no strategies for ${problemState.packet.title}`);
-      problemState.plan = planResult.data;
+      problemState.plan = {
+        ...planResult.data,
+        automaticStrategySelection: strategySelection.diagnostics,
+      };
       problemState.branches = strategies.map((strategy, index) => createBranch(strategy, index));
       await Promise.all(problemState.branches.map((branch) => this.store.prepareBranch(problemState.packet.id, branch.id)));
       await this.store.event("problem.planned", {
@@ -1440,10 +1502,26 @@ function applyVetting(problem, vetting) {
     vetting,
   };
   corrected.statementHash = sha256(corrected.statement);
-  if (!vetting.exactStatementVerified || !vetting.openStatusVerified || !vetting.sourceQualityVerified) {
+  if (
+    !vetting.exactStatementVerified ||
+    !vetting.openStatusVerified ||
+    !vetting.sourceQualityVerified ||
+    vetting.substantiveHumanStudyVerified === false
+  ) {
     corrected.vetting = { ...vetting, recommendation: "reject" };
   }
   return corrected;
+}
+
+function discoverySelectionEntry(problem) {
+  return {
+    problemKey: problem.statementHash,
+    packet: problem,
+    ranking: {
+      priority: problemScore(problem) / 5.4,
+    },
+    attempts: [],
+  };
 }
 
 export function problemScore(problem) {
@@ -1455,24 +1533,6 @@ export function problemScore(problem) {
     0.2 * problem.sourceQuality +
     0.4 * falsification.opportunity
   );
-}
-
-function selectDiverse(problems, count) {
-  const sorted = [...problems].sort((a, b) => problemScore(b) - problemScore(a));
-  const selected = [];
-  const usedDomains = new Set();
-  for (const problem of sorted) {
-    if (selected.length >= count) break;
-    if (!usedDomains.has(problem.domain)) {
-      selected.push(problem);
-      usedDomains.add(problem.domain);
-    }
-  }
-  for (const problem of sorted) {
-    if (selected.length >= count) break;
-    if (!selected.includes(problem)) selected.push(problem);
-  }
-  return selected;
 }
 
 function deduplicateDiscoveredProblems(problems) {
@@ -1613,6 +1673,9 @@ function archiveBranchSession(branch, reason) {
 
 function migrateState(state) {
   state.schemaVersion = 3;
+  state.selectionSeed ??= sha256(
+    `${state.runId ?? "run"}:${state.startedAt ?? "legacy"}`,
+  );
   state.provider = canonicalProviderName(state.provider);
   state.operations ??= {};
   for (const operation of Object.values(state.operations)) {

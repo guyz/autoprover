@@ -33,6 +33,20 @@ class NeedsExpertProvider extends FakeProvider {
   }
 }
 
+class MachineGeneratedOnlyProvider extends FakeProvider {
+  async run(request) {
+    const result = await super.run(request);
+    if (request.schema.name === "problem_vetting") {
+      result.data.substantiveHumanStudyVerified = false;
+      result.data.recommendation = "reject";
+      result.data.materialErrors = [
+        "The only provenance is an automatically generated conjecture list.",
+      ];
+    }
+    return result;
+  }
+}
+
 class BudgetFanoutProvider extends FakeProvider {
   constructor() {
     super();
@@ -76,6 +90,70 @@ class BudgetFanoutProvider extends FakeProvider {
       };
     }
     return super.run(request);
+  }
+}
+
+class RedundantPlannerProvider extends FakeProvider {
+  async run(request) {
+    if (request.schema.name !== "research_portfolio_plan") {
+      return super.run(request);
+    }
+    this.count += 1;
+    const sessionId = `fake-${this.count}`;
+    await request.onStarted?.(sessionId);
+    const exact = {
+      id: "exact-search",
+      title: "Exact bounded search",
+      hypothesis: "A small witness exists.",
+      predictedObservation: "An exact witness appears.",
+      falsifier: "An exact checker rejects every case.",
+      noveltyVector: ["bounded exact search"],
+      preferredTools: ["python"],
+    };
+    return {
+      sessionId,
+      usage: {
+        inputTokens: 100,
+        cachedInputTokens: 0,
+        outputTokens: 50,
+        reasoningTokens: 10,
+      },
+      data: {
+        baseline: "Search exactly.",
+        acceptanceContract: "Produce a checked witness.",
+        strategies: [
+          exact,
+          { ...exact, id: "exact-search-renamed" },
+          {
+            id: "spectral",
+            title: "Spectral obstruction",
+            hypothesis: "An eigenvalue inequality is decisive.",
+            predictedObservation: "A forbidden spectrum is forced.",
+            falsifier: "A checked matrix violates the inequality.",
+            noveltyVector: ["spectral representation"],
+            preferredTools: ["sage"],
+          },
+          {
+            id: "sat",
+            title: "Proof-carrying SAT",
+            hypothesis: "The exact encoding is unsatisfiable.",
+            predictedObservation: "A checked UNSAT certificate appears.",
+            falsifier: "A satisfying model passes the exact checker.",
+            noveltyVector: ["proof carrying sat"],
+            preferredTools: ["cadical"],
+          },
+          {
+            id: "probabilistic",
+            title: "Probabilistic construction",
+            hypothesis: "A random construction succeeds.",
+            predictedObservation: "A moment bound gives positive probability.",
+            falsifier: "An exact dependency calculation defeats the bound.",
+            noveltyVector: ["probabilistic construction"],
+            preferredTools: ["symbolic algebra"],
+          },
+        ],
+      },
+    };
   }
 }
 
@@ -146,6 +224,7 @@ function fixture(name) {
       exactStatementVerified: true,
       openStatusVerified: true,
       sourceQualityVerified: true,
+      substantiveHumanStudyVerified: true,
       correctedStatement: "There is no integer n satisfying P(n).",
       correctedAssumptions: [],
       canonicalSourceUrls: ["https://mathworld.wolfram.com/"],
@@ -285,6 +364,35 @@ test("expert-review recommendations cannot become agent-reproduced candidates", 
   assert.equal(app.state.problems[0].verificationRuns[0].status, "candidate-needs-expert");
 });
 
+test("discovery rejects problems supported only by machine-generated conjecture provenance", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-human-study-gate-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    discovery: {
+      poolSize: 1,
+      attackCount: 1,
+      minimumInterest: 1,
+      minimumTractability: 1,
+      minimumVerifiability: 1,
+    },
+  });
+  const app = await Autoprover.create({
+    config,
+    provider: new MachineGeneratedOnlyProvider(),
+    providerName: "responses",
+    runDir: path.join(root, "run"),
+  });
+  await assert.rejects(
+    () => app.discover(),
+    /no problem whose exact statement, open status, source quality, and substantive human study passed/i,
+  );
+  assert.equal(app.state.problems.length, 0);
+});
+
 test("completed named operations replay without a second provider call or budget charge", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "autoprover-operation-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -343,6 +451,52 @@ test("near-budget parallel fanout waits for every started branch before returnin
     1,
   );
   assert.equal(app.state.budget.callsStarted, 4);
+});
+
+test("the planner overgenerates and the harness suppresses duplicate strategy mechanisms", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-diverse-plan-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    branchesPerProblem: 3,
+    maxConcurrentCalls: 1,
+    maxCalls: 1,
+    discovery: {
+      poolSize: 1,
+      attackCount: 1,
+      minimumInterest: 1,
+      minimumTractability: 1,
+      minimumVerifiability: 1,
+    },
+  });
+  const app = await Autoprover.create({
+    config,
+    provider: new RedundantPlannerProvider(),
+    providerName: "responses",
+    runDir: path.join(root, "run"),
+  });
+  await app.seedProblems(fixture("open_problem_discovery").problems, {
+    vet: false,
+  });
+  await app.run();
+  const problem = app.state.problems[0];
+  assert.equal(problem.branches.length, 3);
+  assert.equal(
+    new Set(
+      problem.branches.map(
+        (branch) => branch.strategy.strategyFingerprint,
+      ),
+    ).size,
+    3,
+  );
+  assert.equal(
+    problem.plan.automaticStrategySelection.suppressedExactDuplicates,
+    1,
+  );
+  assert.equal(problem.plan.automaticStrategySelection.proposedCount, 5);
 });
 
 test("long branches rotate to fresh sessions and repeated evidence stops counting as progress", async (t) => {

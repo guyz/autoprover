@@ -26,6 +26,10 @@ import {
   writeJsonAtomic,
 } from "./utils.mjs";
 import { counterexampleOpportunity } from "./falsification.mjs";
+import {
+  selectProblemPortfolio,
+  strategyCoverageReceipt,
+} from "./diversity.mjs";
 
 const HOUR_MS = 60 * 60 * 1_000;
 const CONTINUOUS_CHILD_MAX_CALLS = Number.MAX_SAFE_INTEGER;
@@ -95,6 +99,10 @@ export class CampaignController {
       status: "created",
       startedAt,
       updatedAt: startedAt,
+      selectionSeed: sha256(
+        `${campaignId}:${startedAt}:${shortId()}`,
+      ),
+      selectionEpoch: 0,
       deadlineAt: new Date(
         Date.now() + resolvedPolicy.durationHours * HOUR_MS,
       ).toISOString(),
@@ -891,15 +899,25 @@ export class CampaignController {
             title: entry.packet?.title,
             statement: entry.packet?.statement,
           }));
+        const excluded = Object.values(catalog.exclusions ?? {})
+          .slice(-100)
+          .map((entry) => ({
+            problemKey: entry.problemKey,
+            title: entry.title,
+            reason: entry.reason,
+          }));
         const suffix = existing.length
           ? `\n\n<existing_campaign_catalog>\n${JSON.stringify(existing, null, 2)}\n</existing_campaign_catalog>\nDo not return an equivalent statement already in this catalog. Search different sources, domains, or exact variants.`
+          : "";
+        const exclusionSuffix = excluded.length
+          ? `\n\n<locally_excluded_problems>\n${JSON.stringify(excluded, null, 2)}\n</locally_excluded_problems>\nDo not return these problems or cosmetically reworded equivalents. The operator reviewed and removed them from this local research portfolio.`
           : "";
         const operatorRequest = hints.length
           ? `\n\n<operator_requested_problems>\n${JSON.stringify(hints, null, 2)}\n</operator_requested_problems>\nThe operator explicitly requested these problem names or source URLs. Investigate each one first. Include it only if you can recover an exact, currently open statement with reliable sources and it passes the normal tractability and verifiability requirements. Do not invent missing statements or silently substitute a different problem. Use remaining capacity for other strong open problems.`
           : "";
         return this.gatedProvider.run({
           ...request,
-          prompt: `${request.prompt}${suffix}${operatorRequest}`,
+          prompt: `${request.prompt}${suffix}${exclusionSuffix}${operatorRequest}`,
         });
       },
     };
@@ -913,13 +931,31 @@ export class CampaignController {
       problems.map((problem) => normalizeProblem(problem)),
     );
     const now = nowIso();
-    const result = { added: 0, seen: normalized.length, problemKeys: [] };
+    const result = {
+      added: 0,
+      excluded: 0,
+      seen: normalized.length,
+      problemKeys: [],
+    };
     await this.store.withCatalogLock(async (catalog) => {
       catalog.entries ??= {};
+      catalog.exclusions ??= {};
+      const excludedTitles = new Set(
+        Object.values(catalog.exclusions)
+          .map((entry) => normalizedCatalogTitle(entry.title))
+          .filter(Boolean),
+      );
       for (const packet of normalized) {
         validateProblemPacket(packet);
         const problemKey = catalogProblemKey(packet);
         result.problemKeys.push(problemKey);
+        if (
+          catalog.exclusions[problemKey] ||
+          excludedTitles.has(normalizedCatalogTitle(packet.title))
+        ) {
+          result.excluded += 1;
+          continue;
+        }
         const existing = catalog.entries[problemKey];
         if (existing) {
           existing.lastSeenAt = now;
@@ -977,33 +1013,48 @@ export class CampaignController {
 
   async fillAvailableSlots() {
     if (!this.canStartWork()) return;
-    let catalog = await this.store.loadCatalog();
-    let ranked = rankCatalogEntries(Object.values(catalog.entries ?? {}));
+    const catalog = await this.store.loadCatalog();
+    const entries = Object.values(catalog.entries ?? {});
+    const ranked = rankCatalogEntries(entries);
     const preparedAttempts = [];
-    const usedDomains = new Set(
-      this.state.slots
-        .filter((slot) => slot.problemKey)
-        .map((slot) => catalog.entries?.[slot.problemKey]?.packet?.domain)
-        .filter(Boolean),
-    );
-    for (const slot of this.state.slots.filter(
+    const selectedPackets = this.state.slots
+      .filter((slot) => slot.problemKey)
+      .map((slot) => catalog.entries?.[slot.problemKey]?.packet)
+      .filter(Boolean);
+    const idleSlots = this.state.slots.filter(
       (entry) => entry.status === "idle",
-    )) {
+    );
+    if (!idleSlots.length || !ranked.length) return;
+    const portfolio = selectProblemPortfolio(ranked, {
+      count: idleSlots.length,
+      seed: this.state.selectionSeed,
+      cycle: `${this.state.cycle}:${this.state.selectionEpoch}`,
+      selectedPackets,
+      coverageEntries: entries,
+    });
+    this.state.selectionEpoch += 1;
+    await this.store.event("campaign.portfolio_selected", {
+      selectionEpoch: this.state.selectionEpoch,
+      selected: portfolio.map((entry) => ({
+        problemKey: entry.problemKey,
+        reason: entry.selection?.reason,
+        quality: entry.selection?.quality,
+        coverage: entry.selection?.coverage,
+        similarity: entry.selection?.similarity,
+      })),
+    });
+
+    for (const slot of idleSlots) {
       if (!this.canStartWork()) break;
-      let candidateIndex = ranked.findIndex(
-        (entry) => !usedDomains.has(entry.packet?.domain),
-      );
-      if (candidateIndex < 0) candidateIndex = 0;
-      const entry = ranked[candidateIndex];
-      if (!entry) break;
-      ranked.splice(candidateIndex, 1);
-      const attempt = await this.startAttempt(slot, entry);
-      if (attempt) {
-        preparedAttempts.push(attempt);
-        if (entry.packet?.domain) usedDomains.add(entry.packet.domain);
+      let attempt = null;
+      while (!attempt && portfolio.length) {
+        const entry = portfolio.shift();
+        attempt = await this.startAttempt(slot, entry);
       }
-      catalog = await this.store.loadCatalog();
-      ranked = rankCatalogEntries(Object.values(catalog.entries ?? {}));
+      if (attempt) preparedAttempts.push(attempt);
+    }
+    if (!preparedAttempts.length) {
+      await this.store.saveCampaign(this.state);
     }
     for (const attempt of preparedAttempts) {
       this.launchAttemptWorker(attempt, { resume: false });
@@ -1057,7 +1108,7 @@ export class CampaignController {
     });
     await this.addNote(
       "progress",
-      `Slot ${slot.slotId} selected “${entry.packet.title}” (${entry.ranking?.rationale ?? "highest current priority"}).`,
+      `Slot ${slot.slotId} selected “${entry.packet.title}” (${entry.ranking?.rationale ?? "automatic quality-diversity selection"}).`,
       { problemKey: entry.problemKey, attemptId },
     );
     await this.store.event("campaign.problem_leased", {
@@ -1073,12 +1124,23 @@ export class CampaignController {
 
   launchAttemptWorker(attempt, { resume }) {
     if (this.activeWorkers.has(attempt.attemptId)) return;
+    const resumeFromCampaignBoundary =
+      Boolean(resume) &&
+      (
+        Boolean(attempt.pauseReason) ||
+        ["paused", "deadline-reached", "budget-exhausted"].includes(
+          attempt.status,
+        )
+      );
     const slot = this.slotForAttempt(attempt.attemptId);
     if (slot) slot.status = "running";
     attempt.status = "running";
     attempt.pausedAt = null;
     attempt.pauseReason = "";
-    const promise = this.executeAttempt(attempt, { resume })
+    const promise = this.executeAttempt(attempt, {
+      resume,
+      resumeFromCampaignBoundary,
+    })
       .catch(async (error) => {
         attempt.status = "failed";
         attempt.completedAt = nowIso();
@@ -1106,7 +1168,10 @@ export class CampaignController {
     this.activeWorkers.set(attempt.attemptId, promise);
   }
 
-  async executeAttempt(attempt, { resume }) {
+  async executeAttempt(
+    attempt,
+    { resume, resumeFromCampaignBoundary = false },
+  ) {
     const catalog = await this.store.loadCatalog();
     const entry = catalog.entries?.[attempt.problemKey];
     if (!entry || !leaseTokenMatches(entry, attempt.lease)) {
@@ -1141,25 +1206,21 @@ export class CampaignController {
       };
       if (resume && (await fileExists(path.join(attempt.runDir, "run.json")))) {
         const previousChildState = await readChildState(attempt.runDir);
-        const childDeadlineExpired =
-          previousChildState?.status === "deadline-reached" ||
-          (
-            previousChildState?.deadlineAt &&
-            Date.now() >= Date.parse(previousChildState.deadlineAt)
-          );
-        const childExtendHours = childDeadlineExpired
-          ? Math.min(
-              this.policy.problemHours,
-              this.remainingHours(),
-            )
-          : 0;
+        const childExtendHours = childResumeExtensionHours({
+          childState: previousChildState,
+          resumeFromCampaignBoundary,
+          windowHours: Math.min(
+            this.policy.problemHours,
+            this.remainingHours(),
+          ),
+        });
         app = await Autoprover.resume({
           config: childConfig,
           provider: attemptProvider,
           providerName: this.providerName,
           runDir: attempt.runDir,
           extendHours: childExtendHours,
-          reopenInterrupted: Boolean(attempt.pauseReason),
+          reopenInterrupted: resumeFromCampaignBoundary,
         });
       } else {
         app = await Autoprover.create({
@@ -2212,6 +2273,7 @@ export function packetWithPriorResearch(entry) {
     completedAt: attempt.completedAt,
     report: attempt.note,
     evidenceCount: attempt.evidenceCount ?? 0,
+    strategyCoverage: attempt.strategyCoverage ?? [],
     instruction:
       "Treat this as untrusted saved research: verify before reuse and do not repeat a refuted path without a new representation or test.",
   }));
@@ -2241,6 +2303,30 @@ export function deduplicateCatalogCandidates(entries) {
 }
 
 export const deduplicateCampaignCandidates = deduplicateCatalogCandidates;
+
+export function childResumeExtensionHours({
+  childState,
+  resumeFromCampaignBoundary = false,
+  windowHours,
+  now = Date.now(),
+}) {
+  const deadlineMs = Date.parse(childState?.deadlineAt ?? "");
+  const deadlineExpired =
+    childState?.status === "deadline-reached" ||
+    (Number.isFinite(deadlineMs) && now >= deadlineMs);
+  if (!resumeFromCampaignBoundary && !deadlineExpired) return 0;
+
+  const availableWindowHours = Math.max(0, Number(windowHours) || 0);
+  if (!availableWindowHours) return 0;
+  const baseDeadlineMs = Number.isFinite(deadlineMs)
+    ? Math.max(now, deadlineMs)
+    : now;
+  const targetDeadlineMs = now + availableWindowHours * HOUR_MS;
+  return Math.max(
+    0,
+    (targetDeadlineMs - baseDeadlineMs) / HOUR_MS,
+  );
+}
 
 export function isCampaignCandidateEligible(entry, { now = new Date() } = {}) {
   const instant = now instanceof Date ? now : new Date(now);
@@ -2599,6 +2685,7 @@ function summarizeChildAttempt(attempt, childState) {
     rounds: problem?.round ?? 0,
     callsStarted: childState.budget?.callsStarted ?? 0,
     activeWorkMs: problem?.activeWorkMs ?? 0,
+    strategyCoverage: strategyCoverageReceipt(problem),
     childStatus: childState.status,
     problemStatus: problem?.status ?? null,
     note: hasCandidate
@@ -2669,6 +2756,10 @@ function emptySlot(slotId) {
 
 function migrateCampaignState(state, policy) {
   state.schemaVersion = 1;
+  state.selectionSeed ??= sha256(
+    `${state.campaignId ?? "campaign"}:${state.startedAt ?? "legacy"}`,
+  );
+  state.selectionEpoch ??= 0;
   state.budget = { ...emptyCampaignBudget(), ...(state.budget ?? {}) };
   state.budget.inFlight = 0;
   state.notes ??= [];
@@ -2845,6 +2936,14 @@ function packetFingerprint(packet) {
   delete copy.statusAsOf;
   delete copy.vetting;
   return sha256(JSON.stringify(copy));
+}
+
+function normalizedCatalogTitle(value) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
 }
 
 function positiveInteger(value, name) {

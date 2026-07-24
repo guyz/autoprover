@@ -87,6 +87,7 @@ class ManualDiscoveryFixtureProvider {
           exactStatementVerified: true,
           openStatusVerified: true,
           sourceQualityVerified: true,
+          substantiveHumanStudyVerified: true,
           correctedStatement: packet.statement,
           correctedAssumptions: packet.assumptions,
           canonicalSourceUrls: packet.sourceUrls,

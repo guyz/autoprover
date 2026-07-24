@@ -11,6 +11,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   CampaignController,
+  childResumeExtensionHours,
   packetWithPriorResearch,
   requestCampaignStop,
 } from "../src/campaign.mjs";
@@ -53,6 +54,14 @@ test("a fresh retry receives compact prior research without local paths", () => 
         completedAt: "2026-07-23T19:13:29.888Z",
         note: "Exact search ruled out all witnesses through size 24.",
         evidenceCount: 47,
+        strategyCoverage: [
+          {
+            fingerprint: "strategy-fingerprint",
+            descriptors: ["method:exact", "novelty:bounded-search"],
+            title: "Bounded exact search",
+            status: "stopped",
+          },
+        ],
         runDir: "/private/local/attempt",
       },
     ],
@@ -66,7 +75,46 @@ test("a fresh retry receives compact prior research without local paths", () => 
     "Exact search ruled out all witnesses through size 24.",
   );
   assert.match(packet.priorResearch[0].instruction, /verify before reuse/i);
+  assert.deepEqual(packet.priorResearch[0].strategyCoverage, [
+    {
+      fingerprint: "strategy-fingerprint",
+      descriptors: ["method:exact", "novelty:bounded-search"],
+      title: "Bounded exact search",
+      status: "stopped",
+    },
+  ]);
   assert.doesNotMatch(JSON.stringify(packet.priorResearch), /private\/local/);
+});
+
+test("a campaign-boundary resume restores a fresh child research window", () => {
+  const now = Date.parse("2026-07-24T15:44:40.000Z");
+  const oldDeadline = now + 45_000;
+  const extensionHours = childResumeExtensionHours({
+    childState: {
+      status: "completed-with-errors",
+      deadlineAt: new Date(oldDeadline).toISOString(),
+    },
+    resumeFromCampaignBoundary: true,
+    windowHours: 2,
+    now,
+  });
+
+  assert.equal(
+    oldDeadline + extensionHours * 60 * 60 * 1_000,
+    now + 2 * 60 * 60 * 1_000,
+  );
+  assert.equal(
+    childResumeExtensionHours({
+      childState: {
+        status: "completed-with-errors",
+        deadlineAt: new Date(oldDeadline).toISOString(),
+      },
+      resumeFromCampaignBoundary: false,
+      windowHours: 2,
+      now,
+    }),
+    0,
+  );
 });
 
 function fixture(schemaName) {
@@ -332,6 +380,8 @@ test(
       Object.values(catalog.entries).every(
         (entry) =>
           entry.attempts.length === 1 &&
+          entry.attempts[0].strategyCoverage.length === 1 &&
+          entry.attempts[0].strategyCoverage[0].fingerprint &&
           entry.lifecycle === "candidate-review" &&
           entry.lease === null,
       ),
@@ -541,6 +591,48 @@ test(
 );
 
 test(
+  "local catalog exclusions prevent rediscovery without becoming visible entries",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-exclusions-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const setup = await campaignFixture(root);
+    const excluded = problem(1);
+    await setup.controller.store.withCatalogLock(async (catalog) => {
+      catalog.exclusions ??= {};
+      catalog.exclusions.localReview = {
+        problemKey: "localReview",
+        title: excluded.title,
+        reason: "Removed after local portfolio review",
+      };
+    });
+
+    const result = await setup.controller.mergeCatalogProblems(
+      [
+        {
+          ...excluded,
+          statement: `${excluded.statement}  `,
+        },
+        problem(2),
+      ],
+      {
+        source: "rediscovery-test",
+        vetted: true,
+      },
+    );
+    const catalog = await setup.controller.store.loadCatalog();
+
+    assert.equal(result.added, 1);
+    assert.equal(result.excluded, 1);
+    assert.equal(Object.keys(catalog.entries).length, 1);
+    assert.equal(Object.values(catalog.entries)[0].packet.title, problem(2).title);
+    assert.equal(Object.keys(catalog.exclusions).length, 1);
+  },
+);
+
+test(
   "a campaign deadline pauses the exact child attempt and resume keeps its run directory",
   { timeout: 4_000 },
   async (t) => {
@@ -729,6 +821,7 @@ test(
     t.after(() => rm(root, { recursive: true, force: true }));
     const setup = await campaignFixture(root);
     const originalDeadline = Date.parse(setup.controller.state.deadlineAt);
+    const originalSelectionSeed = setup.controller.state.selectionSeed;
     await requestCampaignStop(setup.campaignDir, "Pause before discovery");
     const stoppedSnapshot = await setup.controller.run();
     assert.equal(setup.controller.state.status, "stopped");
@@ -757,6 +850,7 @@ test(
     const snapshot = await resumed.run();
 
     assert.deepEqual(resumeDiscoveryCycles, [1]);
+    assert.equal(resumed.state.selectionSeed, originalSelectionSeed);
     assert.equal(snapshot.campaign.status, "completed");
     assert.equal(snapshot.counts.candidates, 3);
     assert.ok(

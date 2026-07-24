@@ -12,7 +12,11 @@ Never weaken, silently reinterpret, or drop a quantifier from the problem. Do no
 Persistence means generating information, not generating more prose. A useful epoch must add a reproducible fact, falsify or prune a path, produce a checkable candidate, or change representation with a concrete falsifier. If the current path has stopped yielding information, say so and reframe it. Do not turn pressure to finish into a lower correctness threshold.
 `.trim();
 
-export function discoveryPrompt(config, currentDate) {
+export function discoveryPrompt(
+  config,
+  currentDate,
+  { diversityBrief = "" } = {},
+) {
   const domains = config.discovery.domains.length
     ? config.discovery.domains.join(", ")
     : "any mathematical domain";
@@ -30,6 +34,10 @@ Prefer problems with all of the following:
 Assess falsification separately from ordinary tractability. Use falsificationType to distinguish a finite witness, an exact computational witness, a constructive counterexample family, a general proof of negation, or no meaningful counterexample route. Score counterexampleSearchability from 0-5: 0 means not applicable or no concrete route; 5 requires a realistic search space plus a decisive, independently reproducible check. Do not award a high score merely because the target is called a conjecture or might be false.
 
 Do current web research. Prefer primary papers and canonical problem databases. Record evidence that the exact variant remains open. Reject ambiguous folklore formulations. Scores are 1-5, where higher tractability means more likely to make real progress now and higher verifiability means cheaper, more objective checking.
+
+<automatic_coverage_policy>
+${diversityBrief || "Return a quality-diverse pool spanning materially different problems and evidence routes."}
+</automatic_coverage_policy>
 `;
 }
 
@@ -42,12 +50,20 @@ ${JSON.stringify(problem, null, 2)}
 
 Independently correct the falsification type and 0-5 counterexample searchability score. A high score requires a concrete search representation and a cheap decisive verifier, not a hunch that the conjecture is false. Set it to 0 when counterexamples are logically inapplicable or no realistic route is known.
 
-Recommend ATTACK only when the exact statement and current open status are adequately supported. Supply corrected wording and assumptions when needed.
+Set substantiveHumanStudyVerified=true only when papers, surveys, monographs, or an authoritative human-curated source show that mathematicians have seriously studied the exact problem or a clearly matching variant. A machine-generated conjecture list alone does not satisfy this requirement.
+
+Recommend ATTACK only when the exact statement, current open status, source quality, and substantive human study are adequately supported. Supply corrected wording and assumptions when needed.
 `;
 }
 
-export function planPrompt(problem, branchCount) {
-  return `Create a portfolio for the exact problem below. Produce ${branchCount} genuinely different, falsifiable strategies. Cover different mathematical representations or evidence routes; do not return cosmetic variants of one idea. At least one strategy should be adversarial/computational when appropriate, and at least one should exploit known structural theory. When counterexampleSearchability is 4 or 5, devote an early branch to the stated counterexample verification plan and produce an exact witness or a reproducible negative search result rather than speculative prose.
+export function planPrompt(
+  problem,
+  proposalCount,
+  activeBranchCount = proposalCount,
+) {
+  return `Create a broad candidate portfolio for the exact problem below. Propose ${proposalCount} genuinely different, falsifiable strategies; the harness will automatically choose ${activeBranchCount} mutually dissimilar strategies to run. Cover different mathematical representations, central lemmas, toolchains, search regions, or evidence routes. Do not return cosmetic variants of one idea. At least one strategy should be adversarial/computational when appropriate, and at least one should exploit known structural theory. When counterexampleSearchability is 4 or 5, include an early strategy for the stated counterexample verification plan and produce an exact witness or a reproducible negative search result rather than speculative prose.
+
+Saved prior research may contain strategy-coverage receipts. Treat them as an anti-duplication registry: do not repeat a prior representation, central lemma, or finite search region unless the new strategy states a materially different algorithm, parameter shard, or falsifier.
 
 <problem>
 ${JSON.stringify(problem, null, 2)}

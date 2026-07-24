@@ -437,6 +437,24 @@ a {
   gap: 0.48rem;
 }
 
+.campaignActions .button {
+  width: 100%;
+}
+
+.controlExplanation {
+  margin: 0;
+  padding: 0.15rem 1.1rem 0.62rem;
+  background: rgba(246, 247, 243, 0.75);
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+
+.campaignForm :disabled:not(.button) {
+  cursor: default;
+  opacity: 0.72;
+}
+
 .button,
 .textButton {
   border: 0;
@@ -861,7 +879,8 @@ a {
   color: #6d4c16;
 }
 
-.selectionReason {
+.selectionReason,
+.problemStateLine {
   display: -webkit-box;
   overflow: hidden;
   margin-top: 0.5rem;
@@ -870,6 +889,11 @@ a {
   line-height: 1.42;
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
+}
+
+.problemStateLine {
+  color: #3f5d56;
+  font-weight: 620;
 }
 
 .workerLease {
@@ -1338,6 +1362,21 @@ a {
   margin-top: 0.9rem;
   padding-top: 0.8rem;
   border-top: 1px solid var(--line);
+}
+
+.attemptHistoryPreserved {
+  margin: 0.8rem 0 0;
+  padding: 0.8rem;
+  border: 1px solid #b9d8d2;
+  border-radius: 0.7rem;
+  background: #f3faf8;
+}
+
+.historyExplanation {
+  margin: 0.28rem 0 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
 }
 
 .attemptHistory ol {

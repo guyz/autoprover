@@ -90,7 +90,14 @@ export class Autoprover {
     });
   }
 
-  static async resume({ config, provider, providerName, runDir, extendHours = 0 }) {
+  static async resume({
+    config,
+    provider,
+    providerName,
+    runDir,
+    extendHours = 0,
+    reopenInterrupted = false,
+  }) {
     const store = new RunStore(runDir);
     await store.acquireLock();
     try {
@@ -121,9 +128,13 @@ export class Autoprover {
       const deadlineAvailable = Date.now() < Date.parse(state.deadlineAt);
       if (callBudgetAvailable && costBudgetAvailable && deadlineAvailable) {
         if (
-          ["budget-exhausted", "deadline-reached", "failed", "awaiting-manual"].includes(
-            state.status,
-          )
+          [
+            "budget-exhausted",
+            "deadline-reached",
+            "failed",
+            "awaiting-manual",
+            ...(reopenInterrupted ? ["completed-with-errors"] : []),
+          ].includes(state.status)
         ) {
           state.status = "running";
           state.stopReason = "";
@@ -131,7 +142,8 @@ export class Autoprover {
         for (const problem of state.problems) {
           if (
             ["budget-exhausted", "awaiting-manual"].includes(problem.status) ||
-            (problem.status === "deadline-reached" && extendHours > 0)
+            (problem.status === "deadline-reached" && extendHours > 0) ||
+            (reopenInterrupted && problem.status === "failed")
           ) {
             problem.status = problem.plan ? "active" : "queued";
             problem.stopReason = "";
@@ -1337,6 +1349,9 @@ export function normalizeProblem(problem) {
     counterexampleVerificationPlan: falsification.assessment,
     whyPromising: String(problem.whyPromising ?? ""),
     risks: Array.isArray(problem.risks) ? problem.risks : [],
+    priorResearch: Array.isArray(problem.priorResearch)
+      ? problem.priorResearch
+      : [],
     statusAsOf: new Date().toISOString().slice(0, 10),
   };
 }

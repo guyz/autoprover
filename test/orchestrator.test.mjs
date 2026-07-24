@@ -423,3 +423,43 @@ test("resume persists raised limits and reopens only deadline-stopped work", asy
   const stored = JSON.parse(await readFile(path.join(runDir, "run.json"), "utf8"));
   assert.equal(stored.configSnapshot.maxCalls, 20);
 });
+
+test("campaign checkpoint recovery can reopen a boundary-interrupted failed problem", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-interrupted-resume-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, { runRoot: root, maxCalls: 20 });
+  const runDir = path.join(root, "run");
+  const app = await Autoprover.create({
+    config,
+    provider: new FakeProvider(),
+    providerName: "responses",
+    runDir,
+  });
+  app.state.status = "completed-with-errors";
+  app.state.problems = [
+    {
+      packet: { id: "interrupted-problem", title: "Interrupted problem" },
+      status: "failed",
+      stopReason: "Campaign call budget reached",
+      plan: { acceptanceContract: "test" },
+      branches: [],
+      verificationRuns: [],
+    },
+  ];
+  await app.store.save(app.state);
+
+  const resumed = await Autoprover.resume({
+    config,
+    provider: new FakeProvider(),
+    providerName: "responses",
+    runDir,
+    extendHours: 1,
+    reopenInterrupted: true,
+  });
+
+  assert.equal(resumed.state.status, "running");
+  assert.equal(resumed.state.problems[0].status, "active");
+  assert.equal(resumed.state.problems[0].stopReason, "");
+});

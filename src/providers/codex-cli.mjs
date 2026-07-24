@@ -39,9 +39,20 @@ export class CodexCliProvider {
 
     const fullPrompt = `${request.instructions}\n\n${request.prompt}`;
     const resumableSessionId = request.resumeId ?? request.sessionId;
+    const isolatedWorkerArgs = [
+      // Research workers must not inherit personal plugins, MCP servers, or
+      // connectors from the operator's Codex config. They retain native web
+      // search plus explicitly enabled command-line network access inside the
+      // isolated branch workspace.
+      "--ignore-user-config",
+      ...(this.config.codex.sandbox === "workspace-write"
+        ? ["-c", "sandbox_workspace_write.network_access=true"]
+        : []),
+    ];
     const commandArgs = resumableSessionId
       ? [
           "exec",
+          ...isolatedWorkerArgs,
           "resume",
           resumableSessionId,
           "-m",
@@ -60,6 +71,7 @@ export class CodexCliProvider {
         ]
       : [
           "exec",
+          ...isolatedWorkerArgs,
           "-m",
           request.model.model,
           "-c",

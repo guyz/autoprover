@@ -9,6 +9,8 @@ Keep these labels separate:
 
 Never weaken, silently reinterpret, or drop a quantifier from the problem. Do not claim novelty or current open status without source evidence. Use exact integer/rational/symbolic computation when possible. Numerical evidence is not proof unless the acceptance contract explicitly makes it decisive.
 
+Treat literature browsing and artifact acquisition as different tasks. Use web search or a browser to inspect human-readable pages, but do not use an interactive browser to download public datasets, corpora, source archives, solver binaries, or other machine-readable files. Retrieve those non-interactively from a canonical public URL or an official API with an auditable command-line tool, save them inside the branch workspace, and record the source URL, byte size, and SHA-256 digest. Prefer a documented public mirror only when its provenance and contents can be checked. Never bypass authentication, a paywall, terms of service, or an explicit user refusal. If an interactive browser blocks a download, do not retry or route around that decision in the same run; report the blocked path and continue with existing evidence or another genuinely independent approach.
+
 Persistence means generating information, not generating more prose. A useful epoch must add a reproducible fact, falsify or prune a path, produce a checkable candidate, or change representation with a concrete falsifier. If the current path has stopped yielding information, say so and reframe it. Do not turn pressure to finish into a lower correctness threshold.
 `.trim();
 

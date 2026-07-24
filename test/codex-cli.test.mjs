@@ -63,6 +63,11 @@ test("Max provider keeps schemas and outputs private", async (t) => {
         schemaPath = args[args.indexOf("--output-schema") + 1];
         outputPath = args[args.indexOf("-o") + 1];
         assert.equal(input, "System policy.\n\nReturn the answer.");
+        assert.equal(args.includes("--ignore-user-config"), true);
+        assert.equal(
+          args.includes("sandbox_workspace_write.network_access=true"),
+          true,
+        );
         assert.equal(env.OPENAI_API_KEY, undefined);
         if (process.platform !== "win32") {
           assert.equal((await stat(schemaPath)).mode & 0o777, 0o600);
@@ -104,6 +109,67 @@ test("Max provider keeps schemas and outputs private", async (t) => {
   if (process.platform !== "win32") {
     assert.equal((await stat(outputPath)).mode & 0o777, 0o600);
   }
+});
+
+test("Max resume calls remain isolated from personal browser plugins", async (t) => {
+  const workspace = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-codex-resume-"),
+  );
+  t.after(() => rm(workspace, { recursive: true, force: true }));
+  let capturedArgs;
+  const provider = new CodexCliProvider(
+    {
+      codex: {
+        binary: "codex",
+        effort: "max",
+        sandbox: "workspace-write",
+        subscriptionOnly: true,
+        turnTimeoutMinutes: 1,
+      },
+    },
+    {
+      processRunner: async ({ args }) => {
+        capturedArgs = args;
+        const outputPath = args[args.indexOf("-o") + 1];
+        await writeFile(outputPath, '{"answer":42}\n', "utf8");
+        return {
+          threadId: "thread-existing",
+          usage: {},
+          stdout: "",
+          stderr: "",
+        };
+      },
+    },
+  );
+
+  await provider.run({
+    operationKey: "isolated-resume",
+    instructions: "System policy.",
+    prompt: "Continue.",
+    model: { model: "gpt-5.6-sol", effort: "max" },
+    schema: {
+      name: "answer",
+      schema: {
+        type: "object",
+        additionalProperties: false,
+        properties: { answer: { type: "integer" } },
+        required: ["answer"],
+      },
+    },
+    workingDir: workspace,
+    resumeId: "thread-existing",
+    timeoutMs: 2_000,
+  });
+
+  assert.deepEqual(capturedArgs.slice(0, 7), [
+    "--search",
+    "exec",
+    "--ignore-user-config",
+    "-c",
+    "sandbox_workspace_write.network_access=true",
+    "resume",
+    "thread-existing",
+  ]);
 });
 
 test("runProcess rejects when the asynchronous thread checkpoint fails", async () => {

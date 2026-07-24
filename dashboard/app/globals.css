@@ -586,29 +586,10 @@ a {
   color: var(--teal-dark);
 }
 
-.problemStatus-checking-solution {
-  border-color: #b9b1d6;
-  background: var(--purple-soft);
-  color: #5f468e;
-}
-
-.problemStatus-checking-partial,
-.problemStatus-checking-claim {
-  border-color: #d6c49c;
-  background: var(--gold-soft);
-  color: #76500f;
-}
-
-.problemStatus-proposed-solution {
+.problemStatus-human-review {
   border-color: #c6b0df;
   background: #f1eafa;
   color: var(--purple);
-}
-
-.problemStatus-verified-partial {
-  border-color: #a8d0c9;
-  background: var(--teal-soft);
-  color: var(--teal-dark);
 }
 
 .problemStatus-solved {
@@ -617,7 +598,7 @@ a {
   color: #246743;
 }
 
-.problemStatus-no-solution {
+.problemStatus-not-solved {
   border-color: #dec590;
   background: var(--gold-soft);
   color: #76500f;

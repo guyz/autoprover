@@ -14,6 +14,7 @@ import {
   childResumeExtensionHours,
   packetWithPriorResearch,
   requestCampaignStop,
+  summarizeChildAttempt,
 } from "../src/campaign.mjs";
 import { loadConfig } from "../src/config.mjs";
 
@@ -115,6 +116,61 @@ test("a campaign-boundary resume restores a fresh child research window", () => 
     }),
     0,
   );
+});
+
+test("campaign projection makes a decisive outcome and never promotes a partial", () => {
+  const attempt = {
+    attemptId: "attempt-decision",
+    runDir: "/tmp/autoprover-attempt-decision",
+    problemKey: "decision-problem",
+    startedAt: "2026-07-24T00:00:00.000Z",
+  };
+  const child = (problem) => ({
+    status: "completed",
+    budget: { callsStarted: 7 },
+    problems: [problem],
+  });
+  const candidate = (status, kind) => ({
+    status,
+    packet: { title: "Decision problem" },
+    bestCandidate: {
+      candidate: { kind },
+    },
+    branches: [],
+    verificationRuns: [],
+  });
+
+  assert.equal(
+    summarizeChildAttempt(
+      attempt,
+      child(candidate("candidate-complete-agent-reproduced", "disproof")),
+    ).outcome,
+    "solved",
+  );
+  assert.equal(
+    summarizeChildAttempt(
+      attempt,
+      child(candidate("candidate-complete-needs-expert", "proof")),
+    ).outcome,
+    "human-review",
+  );
+  const partial = summarizeChildAttempt(
+    attempt,
+    child({
+      status: "exhausted-no-result",
+      packet: { title: "Decision problem" },
+      evidenceKeys: ["saved-lemma"],
+      branches: [],
+      verificationRuns: [
+        {
+          status: "verified-partial-lead",
+          candidate: { kind: "partial" },
+        },
+      ],
+    }),
+  );
+  assert.equal(partial.outcome, "not-solved");
+  assert.equal(partial.hasVerifiedPartial, true);
 });
 
 function fixture(schemaName) {
@@ -352,7 +408,7 @@ test(
     assert.equal(attempts.length, 3);
     assert.equal(new Set(attempts.map((attempt) => attempt.problemKey)).size, 3);
     assert.ok(attempts.every((attempt) => attempt.projectedAt));
-    assert.ok(attempts.every((attempt) => attempt.outcome === "candidate"));
+    assert.ok(attempts.every((attempt) => attempt.outcome === "solved"));
     assert.deepEqual(
       [...new Set(attempts.map((attempt) => attempt.slotId))].sort(),
       [1, 2],
@@ -382,7 +438,7 @@ test(
           entry.attempts.length === 1 &&
           entry.attempts[0].strategyCoverage.length === 1 &&
           entry.attempts[0].strategyCoverage[0].fingerprint &&
-          entry.lifecycle === "candidate-review" &&
+          entry.lifecycle === "solved" &&
           entry.lease === null,
       ),
     );

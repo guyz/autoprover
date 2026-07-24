@@ -595,9 +595,13 @@ export class CampaignController {
       const entry = catalog.entries?.[command.problemKey];
       if (!entry) throw new Error("The requested backlog problem no longer exists");
       if (
-        ["candidate-review", "retired", "quarantined"].includes(
-          entry.lifecycle,
-        )
+        [
+          "solved",
+          "human-review",
+          "candidate-review",
+          "retired",
+          "quarantined",
+        ].includes(entry.lifecycle)
       ) {
         throw new Error(
           `“${entry.packet?.title ?? command.problemKey}” is ${entry.lifecycle} and cannot be queued next`,
@@ -1335,7 +1339,8 @@ export class CampaignController {
       entry.latestNote = summary.note;
       entry.lastAttemptAt = summary.completedAt;
       if (summary.hasCandidate) {
-        entry.lifecycle = "candidate-review";
+        entry.lifecycle =
+          summary.outcome === "solved" ? "solved" : "human-review";
         entry.cooldownUntil = null;
         if (this.policy.stopOnCandidate) {
           this.state.stopRequestedByCandidate = true;
@@ -1388,7 +1393,11 @@ export class CampaignController {
     attempt.outcome = summary.outcome;
     attempt.note = summary.note;
     await this.addNote(
-      summary.hasCandidate ? "candidate" : "result",
+      summary.outcome === "solved"
+        ? "solved"
+        : summary.hasCandidate
+          ? "candidate"
+          : "result",
       summary.note,
       { problemKey: attempt.problemKey, attemptId: attempt.attemptId },
     );
@@ -1699,7 +1708,10 @@ export class CampaignController {
     ) {
       const catalog = await this.store.loadCatalog();
       const hasCandidate = Object.values(catalog.entries ?? {}).some(
-        (entry) => entry.lifecycle === "candidate-review",
+        (entry) =>
+          ["solved", "human-review", "candidate-review"].includes(
+            entry.lifecycle,
+          ),
       );
       this.state.status = hasCandidate ? "completed-with-candidate" : "completed";
     }
@@ -2116,7 +2128,10 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
     .sort((left, right) => String(left.at).localeCompare(String(right.at)))
     .slice(-200);
   const candidateEntries = entries.filter(
-    (entry) => entry.lifecycle === "candidate-review",
+    (entry) =>
+      ["solved", "human-review", "candidate-review"].includes(
+        entry.lifecycle,
+      ),
   );
   const activeVerificationRuns = activeProblems.flatMap(
     (problem) => problem.verification ?? [],
@@ -2629,7 +2644,7 @@ function makeCatalogEntry(
   };
 }
 
-function summarizeChildAttempt(attempt, childState) {
+export function summarizeChildAttempt(attempt, childState) {
   const problem = childState.problems?.[0];
   const evidenceCount =
     (problem?.evidenceKeys?.length ?? 0) +
@@ -2646,6 +2661,10 @@ function summarizeChildAttempt(attempt, childState) {
   const hasVerifiedPartial = (problem?.verificationRuns ?? []).some(
     (run) => run.status === "verified-partial-lead",
   );
+  const problemStatus = String(problem?.status ?? "");
+  const solved =
+    problemStatus === "candidate-complete-agent-reproduced";
+  const needsHumanReview = hasCandidate && !solved;
   const latestSynthesis = problem?.syntheses?.at(-1);
   const latestBranch = (problem?.branches ?? [])
     .flatMap((branch) =>
@@ -2655,15 +2674,13 @@ function summarizeChildAttempt(attempt, childState) {
       })),
     )
     .sort((left, right) => String(right.at).localeCompare(String(left.at)))[0];
-  const outcome = hasCandidate
-    ? "candidate"
+  const outcome = solved
+    ? "solved"
+    : needsHumanReview
+      ? "human-review"
     : childState.status?.includes("error") || problem?.status === "failed"
       ? "failed"
-      : hasVerifiedPartial
-        ? "verified-partial"
-        : evidenceCount
-          ? "progress-no-solution"
-          : "no-result";
+      : "not-solved";
   const title = problem?.packet?.title ?? attempt.problemKey;
   const detail =
     latestSynthesis?.portfolioSummary ||
@@ -2688,9 +2705,13 @@ function summarizeChildAttempt(attempt, childState) {
     strategyCoverage: strategyCoverageReceipt(problem),
     childStatus: childState.status,
     problemStatus: problem?.status ?? null,
-    note: hasCandidate
-      ? `Candidate reported for “${title}”: ${detail}`
-      : `“${title}” ended as ${outcome}: ${detail}`,
+    note: solved
+      ? `Solved “${title}”: the proof or counterexample passed the configured independent checks. ${detail}`
+      : needsHumanReview
+        ? `Human review recommended for “${title}”: a complete proof or counterexample passed the agent checks, but the automated system could not make a decisive final validation. ${detail}`
+        : outcome === "failed"
+          ? `Run error for “${title}”: no mathematical outcome was produced. ${detail}`
+          : `Not solved: “${title}”. ${detail}`,
   };
 }
 
@@ -2900,11 +2921,14 @@ function dashboardEventLevel(level) {
   if (["warning", "error", "diagnostic", "info", "success"].includes(level)) {
     return level;
   }
-  if (["progress", "candidate", "result"].includes(level)) return "success";
+  if (["progress", "candidate", "result", "solved"].includes(level)) {
+    return "success";
+  }
   return "info";
 }
 
 function dashboardEventTitle(level) {
+  if (level === "solved") return "Solved";
   if (level === "candidate") return "Candidate found";
   if (level === "progress") return "Progress";
   if (level === "warning" || level === "error") return "Needs attention";

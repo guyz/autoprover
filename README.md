@@ -136,16 +136,19 @@ discover -> independently vet exact statement/status -> plan diverse portfolio
         -> candidate requiring expert/formal review
 ```
 
-The system never turns model consensus into mathematical truth. These labels are intentionally conservative:
+The dashboard makes a decisive run-level call. Partial lemmas and promising
+directions remain internal research notes; they never become a third outcome.
 
 | Label | Meaning |
 | --- | --- |
-| `candidate-complete-agent-reproduced` | A proof/disproof candidate for a `finite-witness` or `exact-computation` problem had a decisive artifact and survived the configured independent reproduction passes. It is still a candidate, not a certified solution. |
-| `candidate-complete-needs-expert` | A complete proof/disproof candidate passed the configured critics, but it did not meet the exact artifact-reproduction gate. Informal proofs normally end here. |
-| `verified-partial-lead` | An internal verification result for a useful lemma or partial result. Research continues; the full problem is not complete. |
+| `Solved` | A complete proof or counterexample met Autoprover's configured independent reproduction contract. |
+| `Human review` | A complete proof or counterexample survived the agent checks, but the system could not decisively validate it. This state is never used for a partial result. |
+| `Not solved` | The run did not establish a complete proof or counterexample. Verified lemmas, rejected paths, and partial progress are retained only inside Details and as retry context. |
 | `rejected` or `inconclusive` | A verification attempt failed or did not establish enough. The originating branch may receive repair feedback. |
 
-A trusted external checker, formal proof, specialist review, and precedence search remain necessary before publicly calling the underlying problem solved.
+`Solved` is Autoprover's automated verdict, not a claim of community
+acceptance. Before publication, independently inspect the saved artifacts,
+check precedence, and obtain specialist or formal review where appropriate.
 
 ## Quick start
 

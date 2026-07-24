@@ -162,6 +162,6 @@ ${JSON.stringify(problem, null, 2)}
 ${JSON.stringify(candidate, null, 2)}
 </candidate>
 
-A PASS means you independently reproduced the decisive artifact or completed a line-by-line logical check appropriate to the verification mode. Agreement, plausibility, and numerical sampling are not passes. General informal proofs should normally remain candidate-only or need-expert-review even if no flaw is found.
+A PASS means you independently reproduced the decisive artifact or completed a line-by-line logical check appropriate to the verification mode. Agreement, plausibility, and numerical sampling are not passes. Make a decisive recommendation when the evidence supports one. Use needs-expert-review only for a complete proof or counterexample whose correctness remains genuinely undecidable after your full audit; never use it merely as a hedge.
 `;
 }

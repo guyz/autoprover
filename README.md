@@ -1,8 +1,8 @@
 # Autoprover
 
-Autoprover is a resumable research loop that discovers promising open mathematics problems, attacks several in parallel, and keeps working within a configured wall-clock and cost budget. It produces auditable research state and candidate results; it does not certify that a theorem has been solved.
+Autoprover is a resumable research loop that discovers promising open mathematics problems, probes a diverse field, promotes the strongest live leads, and keeps the finalists working within a configured wall-clock and cost budget. It produces auditable research state and candidate results; it does not certify that a theorem has been solved.
 
-It is intentionally not a single chat receiving an endless stream of “keep going.” Each research epoch must create information: an exact fact, a falsified route, certified search-space pruning, a new falsifiable representation, or a candidate with a concrete verification plan. Empty epochs trigger a fresh-context reframe. Candidate authors never approve their own result.
+The default subscription-backed solver is one persistent GPT-5.6 Sol Ultra thread per problem. It receives repeated, concrete research turns and can delegate independent lemmas, searches, and adversarial checks to built-in subagents. Each turn must still create information: an exact fact, a falsified route, certified search-space pruning, a new falsifiable representation, or a complete solution. Empty turns eventually trigger a fresh-context reframe. Candidate authors never approve their own result.
 
 ## Why another prompt can help
 
@@ -28,11 +28,13 @@ Open the printed `http://127.0.0.1:4317/` URL, choose a provider, a 12- or 24-ho
 
 The campaign keeps one persistent, deduplicated catalog under `runs/_catalog/`. When the eligible queue runs low it launches a fresh discovery-and-vetting cycle, records immutable packet versions, and rechecks stale open-status evidence. Discovery requires substantive human mathematical study or an authoritative source; a machine-generated conjecture list alone is not accepted as evidence of interest or open status.
 
-Problem selection is automatic and quality-diverse. The displayed priority still summarizes mathematical interest, predicted solvability, verifiability, source quality, prior progress, and counterexample opportunity, but the controller does not deterministically take the top rows. It combines that quality estimate with catalog coverage, uncertainty, prior effort, similarity to problems already running, and a durable run-specific random seed. This works for any number of problem slots, spreads independent installations over different qualified problems, and reproduces the same decisions after resume. There is no dashboard setting to tune.
+Problem selection is automatic and quality-diverse. A tournament round first runs short probes across the field. It scores measured artifacts, exact facts, search pruning, concrete next actions, blockers, and the problem's decisive-artifact readiness. It then resumes the best-scoring probe directories as persistent deep runs; the losing probes remain saved locally. When the finalists end without a solution and time remains, the controller starts another round on different problems. This works for any number of problem slots and adds no dashboard tuning knob.
+
+Before a problem enters the tournament, discovery must identify the minimum decisive artifact, whether its inputs and verifier are available now, and any blocking dependency. These operational checks temper the model's speculative tractability score. Catalog selection still uses interest, source quality, counterexample opportunity, coverage, similarity, prior effort, and a durable installation-specific seed so independent installations do not all converge on one favorite.
 
 Counterexample routes receive a bounded ranking lift only when discovery and independent vetting identify a concrete search space and decisive checker. A conjecture/disproof label alone receives no boost. Finite exact witnesses can add up to 8 priority points; less mechanically checkable routes receive less. See the [counterexample prioritization research note](docs/counterexample-prioritization.md) for the empirical basis and caveats.
 
-Each problem gets one fenced lease and one immutable child run directory. Free worker slots refill continuously, while every problem's internal strategies use isolated branch workspaces. The planner proposes more strategies than will run; the controller fingerprints their representations, tools, central claims, and falsifiers, suppresses exact duplicates, and chooses a mutually dissimilar subset. Compact strategy-coverage receipts are carried into later attempts so retries avoid previously exhausted mechanisms unless they introduce a different algorithm, parameter shard, or falsifier. This anti-duplication machinery is internal and adds no operator controls.
+Each problem gets one fenced lease and one immutable child run directory. Promotion resumes that exact directory, provider session, artifacts, failures, and verified facts. By default the planner chooses one persistent root strategy; GPT-5.6 Sol Ultra fans out genuinely independent work through its own subagents. The controller still fingerprints proposed representations, tools, central claims, and falsifiers, and compact strategy-coverage receipts prevent later retries from rebuilding exhausted mechanisms.
 
 A crash can resume the same discovery or attempt without replaying completed model calls. **Pause** prevents new model calls, lets calls already in flight checkpoint, freezes the unused campaign time, and leaves the campaign resumable. **Continue** restores those exact attempts; optionally adding time extends the frozen remainder rather than silently replacing it. Completed attempts remain in the dashboard with their coordinator report, branch histories, failed paths, artifacts, and verification passes.
 
@@ -51,8 +53,8 @@ The equivalent CLI commands are:
 
 ```bash
 node src/cli.mjs campaign --yes \
-  --provider max --hours 24 --parallel-problems 2 \
-  --max-calls 60 --continuous
+  --provider max --hours 24 --parallel-problems 6 \
+  --max-calls 240 --continuous
 
 node src/cli.mjs campaign --yes --resume --continuous
 node src/cli.mjs campaign --yes --resume --extend-hours 12 --continuous
@@ -60,7 +62,7 @@ node src/cli.mjs campaign --yes --resume --extend-hours 12 --continuous
 
 `--max-cycles 0` means discovery can continue until the wall-clock or call/cost guard stops it. A positive value is useful for bounded evaluations. Campaign-global limits are enforced across every child run, so parallel workers cannot each consume the full call budget independently.
 
-`parallelProblems` and `maxConcurrentCalls` are different controls. For example, six problem slots with four concurrent calls means six problem portfolios remain active, but at most four model invocations run at once; the other portfolios wait for the shared call semaphore without losing their leases or state.
+`parallelProblems` is the width of a probe round. `maxConcurrentCalls` is the global model-call ceiling. The defaults match at six for the probe, then automatically narrow to two deep finalists. The dashboard names those phases explicitly, so two deep workers are not presented as four broken slots.
 
 ## Model choice
 
@@ -68,7 +70,7 @@ The harness exposes four explicit providers behind the same structured research 
 
 | Provider | Worker | Authentication and cost |
 | --- | --- | --- |
-| `max` | GPT-5.6 Sol through `codex exec`, Max reasoning | ChatGPT/Codex subscription allowance |
+| `max` | GPT-5.6 Sol through `codex exec`; Ultra for solver turns | ChatGPT/Codex subscription allowance |
 | `pro` | GPT-5.6 Sol through Responses API, Pro mode + Max reasoning | `OPENAI_API_KEY`; separately API billed |
 | `pro-manual` | ChatGPT Pro through schema-checked copy/paste packets | ChatGPT subscription; requires a human for every packet |
 | `fable` | Claude Fable 5 through `claude --print`, Max effort | Claude.ai Max subscription allowance |
@@ -84,7 +86,7 @@ node src/cli.mjs run --yes --provider pro-manual
 
 The Fable adapter uses the full `claude-fable-5` model ID, Max effort, a separate resumable session for every branch, JSON Schema output, safe mode, and the local Claude.ai login. Its required `subscriptionOnly: true` setting removes Anthropic API/proxy environment variables before launching Claude so a subscription run cannot silently become an API-billed run. The Max adapter enforces the same subscription-only rule for Codex and strips OpenAI API billing credentials from its child process.
 
-The Max adapter similarly uses the ChatGPT-authenticated Codex CLI. Each Max worker starts with `--ignore-user-config`: authentication is retained, but personal plugins, MCP servers, browser sessions, and connectors are not inherited. Workers still have native web search and their isolated shell workspace. For the default `workspace-write` sandbox, the harness explicitly enables outbound command-line network access so public corpora can be fetched without the operator's browser. This keeps autonomous research reproducible, prevents an unrelated browser/download preference from stalling a branch, and avoids exposing personal integrations to a math worker. Public machine-readable artifacts are fetched non-interactively into the branch workspace and recorded with their source, size, and SHA-256 digest; interactive browsing is reserved for reading pages.
+The Max adapter similarly uses the ChatGPT-authenticated Codex CLI. Solver turns use Ultra reasoning and explicitly enable built-in multi-agent work; scouts keep their cheaper configured effort. Each worker starts with `--ignore-user-config`: authentication is retained, but personal plugins, MCP servers, browser sessions, and connectors are not inherited. Workers still have native web search and their isolated shell workspace. For the default `workspace-write` sandbox, the harness explicitly enables outbound command-line network access so public corpora can be fetched without the operator's browser. This keeps autonomous research reproducible, prevents an unrelated browser/download preference from stalling a branch, and avoids exposing personal integrations to a math worker. Public machine-readable artifacts are fetched non-interactively into the branch workspace and recorded with their source, size, and SHA-256 digest; interactive browsing is reserved for reading pages.
 
 The Pro adapter is the only provider whose token usage contributes to `maxEstimatedUsd`. Ordinary CLI runs treat `maxCalls` as a hard guard for every provider. A campaign started with `--continuous` renews that allowance only for subscription-backed providers and still stops at its wall-clock deadline.
 
@@ -127,17 +129,21 @@ The import is rejected unless it matches the packet's exact JSON Schema. Packet,
 ## Research state machine
 
 ```text
-discover -> independently vet exact statement/status -> plan diverse portfolio
-    -> run evidence-producing epochs
+discover -> independently vet exact statement/status and artifact readiness
+    -> short probes across a quality-diverse field
+    -> automatically promote measured progress
+    -> resume persistent finalist threads
+    -> run evidence-producing epochs and internal subagents
         -> deepen / branch / verify / reframe / stop
-    -> candidate -> blind verifier 1 -> blind verifier 2
+    -> complete proof/disproof -> blind verifier 1 -> blind verifier 2
         -> reject and repair
         -> candidate reproduced by fresh agent contexts
         -> candidate requiring expert/formal review
 ```
 
 The dashboard makes a decisive run-level call. Partial lemmas and promising
-directions remain internal research notes; they never become a third outcome.
+directions remain internal research notes; they never enter the expensive
+verification queue and never become a third outcome.
 
 | Label | Meaning |
 | --- | --- |
@@ -167,7 +173,7 @@ Subscription-backed Max run:
 
 ```bash
 codex login status
-node src/cli.mjs run --yes --provider max --hours 12 --parallel-problems 2 --max-calls 60
+node src/cli.mjs campaign --yes --provider max --hours 24 --parallel-problems 6 --max-calls 240 --continuous
 ```
 
 API Pro run:
@@ -190,7 +196,7 @@ Use `--hours 24` for a fresh 24-hour window:
 node src/cli.mjs run --yes --hours 24 --parallel-problems 2 --max-calls 120 --max-usd 200
 ```
 
-For a fresh run longer than 12 hours, each problem must pass a checkpoint after 12 hours of its own active worker time: it needs either an evidence-bearing proof/code/data/counterexample artifact with reproduction instructions, or a verifier pass with reproduced checks and an independent artifact. Queue time and time while the harness is offline do not count toward this checkpoint. A problem with no such evidence stops as `exhausted-no-result` instead of consuming further compute. The overall run still has one wall-clock deadline, and calls or API cost can stop it earlier.
+The default tournament does not impose the old hour-12 evidence cutoff. Its short probe is the allocation gate; promoted finalists may use the remaining wall-clock window even when the useful path needs several otherwise uneventful “keep going” turns. Turn, reframe, campaign-time, call, and API-cost limits still apply.
 
 Use an exact manually curated problem packet instead of automatic discovery. `problems.example.json` is a schema-shaped template with placeholder text and an `example.com` URL; it is intentionally rejected until you replace every placeholder with a real, sourced problem:
 
@@ -212,7 +218,7 @@ node src/cli.mjs status --run-dir runs/<run-id>
 node src/cli.mjs resume --yes --run-dir runs/<run-id> --extend-hours 12
 ```
 
-`status` is read-only and makes no model calls. `resume --extend-hours 12` extends the deadline by 12 hours from the later of the current time or stored deadline and reopens deadline-stopped problems. `--hours` is intentionally a new-run option and is rejected by `resume`; use `--extend-hours` there. Resume does not reopen a problem already marked `exhausted-no-result`, and a budget-stopped run also requires a higher `--max-calls` or `--max-usd` value. Use a fresh `--hours 24` run when you want one initial 24-hour experiment with the hour-12 evidence gate.
+`status` is read-only and makes no model calls. `resume --extend-hours 12` extends the deadline by 12 hours from the later of the current time or stored deadline and reopens deadline-stopped problems. `--hours` is intentionally a new-run option and is rejected by `resume`; use `--extend-hours` there. Resume does not reopen a problem already marked `exhausted-no-result`, and a budget-stopped API run also requires a higher `--max-calls` or `--max-usd` value.
 
 All commands that can make live model calls print a preflight and require `--yes` (or `AUTOPROVER_CONFIRM=1`). Help, validation, status, syntax checks, tests, `doctor`, and manual queue inspection/import do not start research calls.
 
@@ -230,7 +236,7 @@ The top-level status describes why the whole run stopped; each problem has its o
 | `completed-with-candidate-and-errors` | A candidate completed, but at least one other problem failed. |
 | `awaiting-manual` | A `pro-manual` run exported one or more packets and is waiting for schema-valid imports before resume. |
 
-During execution, `created`, `discovering`, `ready`, and `running` are ordinary transient states. At problem level, `exhausted-no-result` means the configured branch, reframe, stagnation, or hour-12 evidence limits were exhausted—not that the mathematical problem has been shown impossible.
+During execution, `created`, `discovering`, `ready`, and `running` are ordinary transient states. At problem level, `exhausted-no-result` means the configured turn, reframe, or stagnation limits were exhausted—not that the mathematical problem has been shown impossible.
 
 ## Persistence and parallelism
 

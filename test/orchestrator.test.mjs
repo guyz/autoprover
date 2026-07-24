@@ -191,6 +191,52 @@ class LoopWithoutCandidateProvider extends FakeProvider {
   }
 }
 
+class PartialLeadProvider extends FakeProvider {
+  async run(request) {
+    if (request.schema.name !== "research_epoch_result") {
+      return super.run(request);
+    }
+    this.count += 1;
+    const sessionId = `partial-${this.count}`;
+    await request.onStarted?.(sessionId);
+    return {
+      sessionId,
+      usage: {
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        outputTokens: 10,
+        reasoningTokens: 0,
+      },
+      data: {
+        status: "progress",
+        progressKind: "verified-fact",
+        summary: "A useful lemma was proved, but the full problem remains open.",
+        verifiedFacts: ["The bounded auxiliary lemma holds."],
+        plausibleClaims: [],
+        failedApproaches: [],
+        unresolvedQuestions: ["Extend the lemma to the unbounded case."],
+        artifacts: [
+          {
+            name: "bounded-lemma",
+            kind: "lemma",
+            content: "Proof of the bounded auxiliary lemma.",
+            verification: "Check the displayed induction.",
+          },
+        ],
+        candidate: {
+          present: true,
+          kind: "partial",
+          claim: "The bounded auxiliary lemma holds.",
+          solution: "Induction proves the bounded auxiliary statement.",
+          verificationPlan: "Check the induction.",
+        },
+        nextAction: "deepen",
+        nextActionReason: "Use the lemma on the remaining unbounded case.",
+      },
+    };
+  }
+}
+
 function fixture(name) {
   if (name === "open_problem_discovery") {
     return {
@@ -213,6 +259,10 @@ function fixture(name) {
           counterexampleSearchability: 5,
           counterexampleVerificationPlan:
             "Enumerate exact integer candidates and independently evaluate P.",
+          minimumDecisiveArtifact:
+            "One explicit integer witness with a reproducible exact evaluation of P.",
+          artifactReadiness: 5,
+          blockingDependencies: [],
           whyPromising: "A witness is decisive.",
           risks: [],
         },
@@ -235,6 +285,10 @@ function fixture(name) {
       correctedCounterexampleSearchability: 5,
       counterexampleAssessment:
         "The witness space is exactly searchable and each candidate is decisive.",
+      correctedMinimumDecisiveArtifact:
+        "One explicit integer witness with a reproducible exact evaluation of P.",
+      correctedArtifactReadiness: 5,
+      blockingDependencies: [],
       recommendation: "attack",
     };
   }
@@ -333,6 +387,50 @@ test("end-to-end loop discovers, attacks, and independently verifies a finite ca
   assert.equal(app.state.problems[0].status, "candidate-complete-agent-reproduced");
   assert.equal(app.state.problems[0].verificationRuns[0].passes.length, 2);
   assert.equal(app.state.budget.callsStarted, 6);
+});
+
+test("partial leads stay in the solver loop and never consume verifier calls", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "autoprover-partial-loop-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    branchesPerProblem: 1,
+    maxConcurrentCalls: 1,
+    maxCalls: 4,
+    maxTurnsPerBranch: 2,
+    maxPortfolioStagnationRounds: 8,
+    skipSingleBranchSynthesis: true,
+  });
+  const provider = new PartialLeadProvider();
+  const app = await Autoprover.create({
+    config,
+    provider,
+    providerName: "max",
+    runDir: path.join(root, "run"),
+  });
+  await app.seedProblems(
+    [fixture("open_problem_discovery").problems[0]],
+    { vet: false },
+  );
+
+  await app.run();
+
+  const state = app.state.problems[0];
+  assert.equal(state.branches[0].turns, 2);
+  assert.equal(state.partialLeads.length, 1);
+  assert.equal(state.verificationRuns.length, 0);
+  assert.equal(
+    provider.count,
+    3,
+    "one planner and two persistent solver turns should run",
+  );
+  assert.equal(
+    Object.values(app.state.operations).some(
+      (operation) => operation.role === "critic",
+    ),
+    false,
+  );
 });
 
 test("expert-review recommendations cannot become agent-reproduced candidates", async (t) => {

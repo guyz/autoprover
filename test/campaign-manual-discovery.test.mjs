@@ -33,6 +33,10 @@ function discoveredProblem() {
     counterexampleSearchability: 5,
     counterexampleVerificationPlan:
       "Enumerate exact finite objects and independently check property P.",
+    minimumDecisiveArtifact:
+      "One explicit finite object with a reproducible exact property check.",
+    artifactReadiness: 5,
+    blockingDependencies: [],
     whyPromising: "A finite witness would settle the statement.",
     risks: [],
   };
@@ -98,6 +102,10 @@ class ManualDiscoveryFixtureProvider {
           correctedCounterexampleSearchability: 5,
           counterexampleAssessment:
             "A finite witness would be decisive and independently checkable.",
+          correctedMinimumDecisiveArtifact:
+            packet.minimumDecisiveArtifact,
+          correctedArtifactReadiness: packet.artifactReadiness,
+          blockingDependencies: packet.blockingDependencies,
           recommendation: "attack",
         },
       };

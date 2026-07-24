@@ -80,6 +80,13 @@ export const DISCOVERY_SCHEMA = {
               maximum: 5,
             },
             counterexampleVerificationPlan: nonEmptyString,
+            minimumDecisiveArtifact: nonEmptyString,
+            artifactReadiness: {
+              type: "integer",
+              minimum: 1,
+              maximum: 5,
+            },
+            blockingDependencies: stringArray,
             whyPromising: nonEmptyString,
             risks: stringArray,
           },
@@ -100,6 +107,9 @@ export const DISCOVERY_SCHEMA = {
             "falsificationType",
             "counterexampleSearchability",
             "counterexampleVerificationPlan",
+            "minimumDecisiveArtifact",
+            "artifactReadiness",
+            "blockingDependencies",
             "whyPromising",
             "risks"
           ],
@@ -136,6 +146,13 @@ export const VET_SCHEMA = {
         maximum: 5,
       },
       counterexampleAssessment: nonEmptyString,
+      correctedMinimumDecisiveArtifact: nonEmptyString,
+      correctedArtifactReadiness: {
+        type: "integer",
+        minimum: 1,
+        maximum: 5,
+      },
+      blockingDependencies: stringArray,
       recommendation: { type: "string", enum: ["attack", "defer", "reject"] },
     },
     required: [
@@ -152,6 +169,9 @@ export const VET_SCHEMA = {
       "correctedFalsificationType",
       "correctedCounterexampleSearchability",
       "counterexampleAssessment",
+      "correctedMinimumDecisiveArtifact",
+      "correctedArtifactReadiness",
+      "blockingDependencies",
       "recommendation"
     ],
   },

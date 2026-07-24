@@ -72,6 +72,10 @@ export function validateConfig(config) {
   }
   positive("maxEstimatedUsd", config.maxEstimatedUsd, true);
   positive("roundCooldownSeconds", config.roundCooldownSeconds, true);
+  positive("extensionGateHours", config.extensionGateHours ?? 0, true);
+  if (typeof config.skipSingleBranchSynthesis !== "boolean") {
+    throw new Error("skipSingleBranchSynthesis must be boolean");
+  }
   integer("maxRepairCycles", config.maxRepairCycles, true);
   integer("maxReframesPerBranch", config.maxReframesPerBranch, true);
   if (
@@ -100,6 +104,48 @@ export function validateConfig(config) {
   );
   if (typeof config.campaign.stopOnCandidate !== "boolean") {
     throw new Error("campaign.stopOnCandidate must be boolean");
+  }
+  if (
+    !config.campaign.tournament ||
+    typeof config.campaign.tournament !== "object" ||
+    Array.isArray(config.campaign.tournament)
+  ) {
+    throw new Error("campaign.tournament configuration is required");
+  }
+  if (typeof config.campaign.tournament.enabled !== "boolean") {
+    throw new Error("campaign.tournament.enabled must be boolean");
+  }
+  integer(
+    "campaign.tournament.probeProblemCount",
+    config.campaign.tournament.probeProblemCount,
+  );
+  positive(
+    "campaign.tournament.probeHours",
+    config.campaign.tournament.probeHours,
+  );
+  integer(
+    "campaign.tournament.minimumPromotableProbes",
+    config.campaign.tournament.minimumPromotableProbes,
+  );
+  integer(
+    "campaign.tournament.deepProblemCount",
+    config.campaign.tournament.deepProblemCount,
+  );
+  if (
+    config.campaign.tournament.minimumPromotableProbes >
+    config.campaign.tournament.probeProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.minimumPromotableProbes cannot exceed probeProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.deepProblemCount >
+    config.campaign.tournament.probeProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.deepProblemCount cannot exceed probeProblemCount",
+    );
   }
   if (
     !config.discovery ||
@@ -154,6 +200,13 @@ export function validateConfig(config) {
     throw new Error("codex.binary must be a non-empty string");
   }
   positive("codex.turnTimeoutMinutes", config.codex.turnTimeoutMinutes);
+  if (
+    !["none", "low", "medium", "high", "xhigh", "max", "ultra"].includes(
+      config.codex.effort,
+    )
+  ) {
+    throw new Error("codex.effort is not supported");
+  }
   if (config.codex.subscriptionOnly !== true) {
     throw new Error(
       "codex.subscriptionOnly must be true; use provider=pro for API-billed OpenAI work",

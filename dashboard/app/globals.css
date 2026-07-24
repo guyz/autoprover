@@ -604,6 +604,12 @@ a {
   color: #76500f;
 }
 
+.problemStatus-saved {
+  border-color: #b8c8c1;
+  background: #eef3f0;
+  color: #50615a;
+}
+
 .problemStatus-failed {
   border-color: #e1aaa7;
   background: var(--red-soft);

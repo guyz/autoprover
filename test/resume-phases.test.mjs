@@ -250,6 +250,7 @@ test("a completed synthesis checkpoint is applied before any later branch turn",
       maxCalls: 6,
       maxTurnsPerBranch: 1,
       maxPortfolioStagnationRounds: 3,
+      skipSingleBranchSynthesis: false,
     },
     provider,
   );

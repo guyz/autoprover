@@ -446,6 +446,129 @@ test(
 );
 
 test(
+  "the tournament probes broadly, promotes measured progress, and resumes the same run directories",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-tournament-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const problems = [problem(1), problem(2), problem(3), problem(4)];
+    const setup = await campaignFixture(root, {
+      problems,
+      parallelProblems: 4,
+      policy: {
+        tournamentEnabled: true,
+        probeProblemCount: 4,
+        minimumPromotableProbes: 4,
+        deepProblemCount: 2,
+        probeHours: 0.01,
+      },
+    });
+    await setup.controller.mergeCatalogProblems(problems, {
+      source: "tournament-test",
+      vetted: true,
+    });
+    const catalog = await setup.controller.store.loadCatalog();
+    const entries = Object.values(catalog.entries);
+    const runDirs = new Map();
+
+    for (const [index, entry] of entries.entries()) {
+      const attempt = await setup.controller.startAttempt(
+        setup.controller.state.slots[index],
+        entry,
+        { stage: "probe" },
+      );
+      runDirs.set(entry.problemKey, attempt.runDir);
+      const artifactCount = index;
+      const childState = {
+        status: "deadline-reached",
+        budget: { callsStarted: index + 1 },
+        problems: [
+          {
+            packet: entry.packet,
+            status: "deadline-reached",
+            stopReason: "Probe window ended",
+            round: index + 1,
+            activeWorkMs: (index + 1) * 1_000,
+            evidenceKeys: Array.from(
+              { length: index + 1 },
+              (_, evidenceIndex) => `evidence-${index}-${evidenceIndex}`,
+            ),
+            branches: [
+              {
+                verifiedFacts: Array.from(
+                  { length: index + 1 },
+                  (_, factIndex) => `fact-${index}-${factIndex}`,
+                ),
+                failedApproaches: [],
+                evidenceKeys: [],
+                history: [
+                  {
+                    summary: "The probe produced a concrete exact result.",
+                    progressKind: "verified-fact",
+                    nextAction: "deepen",
+                    nextActionReason: "Extend the exact result.",
+                    artifacts: Array.from(
+                      { length: artifactCount },
+                      (_, artifactIndex) => ({
+                        kind: "code",
+                        verification: `Run checker ${artifactIndex}.`,
+                      }),
+                    ),
+                  },
+                ],
+              },
+            ],
+            verificationRuns: [],
+          },
+        ],
+      };
+      const summary = summarizeChildAttempt(attempt, childState);
+      await setup.controller.checkpointProbeAttempt(
+        attempt,
+        childState,
+        summary,
+      );
+    }
+
+    await setup.controller.advanceTournamentIfReady();
+
+    assert.equal(setup.controller.state.tournament.stage, "deep");
+    assert.equal(
+      setup.controller.state.tournament.promotedProblemKeys.length,
+      2,
+    );
+    const promoted = Object.values(setup.controller.state.attempts)
+      .filter((attempt) => attempt.stage === "deep")
+      .sort((left, right) => right.probeScore - left.probeScore);
+    assert.equal(promoted.length, 2);
+    assert.ok(promoted[0].probeScore > promoted[1].probeScore);
+    assert.ok(
+      Object.values(setup.controller.state.attempts)
+        .filter((attempt) => attempt.status === "not-promoted")
+        .every((attempt) => attempt.projectedAt),
+    );
+
+    const launches = [];
+    setup.controller.launchAttemptWorker = (attempt, options) => {
+      launches.push({ attempt, options });
+    };
+    await setup.controller.fillAvailableSlots();
+
+    assert.equal(launches.length, 2);
+    assert.ok(launches.every((launch) => launch.options.resume === true));
+    assert.ok(
+      launches.every(
+        ({ attempt }) =>
+          attempt.runDir === runDirs.get(attempt.problemKey),
+      ),
+      "promotion must resume each finalist's exact probe directory",
+    );
+  },
+);
+
+test(
   "a shared campaign maxCalls gate cannot oversubscribe across parallel child runs",
   { timeout: 8_000 },
   async (t) => {

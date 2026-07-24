@@ -28,6 +28,14 @@ type Campaign = {
   continuous?: boolean;
   parallelProblems?: number;
   maxConcurrentCalls?: number;
+  tournament?: {
+    enabled: boolean;
+    stage: string;
+    round: number;
+    probeTarget?: number | null;
+    probesCompleted?: number;
+    finalists?: number;
+  } | null;
   timeLeftMs: number;
   pausedAt?: string | null;
   latestNote?: string;
@@ -105,6 +113,7 @@ type ResearchProblem = {
   title: string;
   domain: string;
   status: string;
+  stage?: string;
   activeWorkMs: number;
   callsStarted?: number;
   coordinatorNote?: string;
@@ -172,6 +181,7 @@ type ProblemState =
   | "human-review"
   | "solved"
   | "not-solved"
+  | "saved"
   | "failed"
   | "paused"
   | "waiting";
@@ -247,6 +257,7 @@ const PROBLEM_STATE_LABELS: Record<ProblemState, string> = {
   "human-review": "Human review",
   solved: "Solved",
   "not-solved": "Not solved",
+  saved: "Saved",
   failed: "Run error",
   paused: "Paused",
   waiting: "Waiting",
@@ -258,8 +269,9 @@ const PROBLEM_STATE_ORDER: Record<ProblemState, number> = {
   working: 2,
   paused: 3,
   "not-solved": 4,
-  failed: 5,
-  waiting: 6,
+  saved: 5,
+  failed: 6,
+  waiting: 7,
 };
 
 function normalizeDashboard(input: unknown): DashboardData {
@@ -462,6 +474,7 @@ function classifyProblem(
   }
   const lifecycle = (catalog.lifecycle ?? catalog.state).toLowerCase();
   if (live && LIVE_PROBLEM_STATES.has(live.status)) return "working";
+  if (catalog.state === "saved") return "saved";
   const latestOutcome =
     catalog.attemptHistory?.at(-1)?.outcome ?? catalog.lastOutcome ?? "";
   const hasProjectedAttempt = Boolean(catalog.attemptHistory?.length);
@@ -511,6 +524,12 @@ function problemHeadline(view: ProblemView) {
     if (activeVerificationScope(verificationRuns(live)) === "solution") {
       return "Testing a possible proof or counterexample";
     }
+    if (live?.stage === "probing solution potential") {
+      return "Short probe measuring concrete progress";
+    }
+    if (live?.stage === "persistent deep solving") {
+      return "Finalist in persistent deep work";
+    }
     const count = live?.branches.length ?? 0;
     return count
       ? `${count} approach${count === 1 ? "" : "es"} in progress`
@@ -520,6 +539,9 @@ function problemHeadline(view: ProblemView) {
   if (state === "failed") return "Run ended with a system error";
   if (state === "not-solved") {
     return "No proof or counterexample was established";
+  }
+  if (state === "saved") {
+    return "Probe saved; another problem was promoted for deep work";
   }
   return "Waiting to be picked up";
 }
@@ -778,7 +800,7 @@ function ProblemCard({
                 : "Stop this attempt and pick another"}
             </button>
           )}
-          {!live && ["not-solved", "waiting", "failed"].includes(state) && (
+          {!live && ["not-solved", "saved", "waiting", "failed"].includes(state) && (
             <button
               type="button"
               className="button buttonSecondary"
@@ -810,8 +832,8 @@ export default function AutoproverDashboard() {
   const [settings, setSettings] = useState<CampaignSettings>({
     provider: "max",
     hours: 24,
-    parallelProblems: 2,
-    maxCalls: 60,
+    parallelProblems: 6,
+    maxCalls: 240,
     maxEstimatedUsd: 100,
   });
   const [resumeExtraHours, setResumeExtraHours] = useState<number | null>(
@@ -954,6 +976,7 @@ export default function AutoproverDashboard() {
       "human-review": 0,
       solved: 0,
       "not-solved": 0,
+      saved: 0,
       failed: 0,
       paused: 0,
       waiting: 0,
@@ -1185,7 +1208,11 @@ export default function AutoproverDashboard() {
                     {isActive && !campaignProcessRunning
                       ? "Restarting from the last saved checkpoint"
                       : isActive
-                      ? `${workingNow}/${configuredProblemSlots} problems active`
+                      ? data.campaign.tournament?.stage === "probing"
+                        ? `${workingNow}/${configuredProblemSlots} short probes active · ${data.campaign.tournament.probesCompleted ?? 0}/${data.campaign.tournament.probeTarget ?? "?"} compared`
+                        : data.campaign.tournament?.stage === "deep"
+                          ? `${workingNow} finalist${workingNow === 1 ? "" : "s"} in persistent deep work`
+                          : `${workingNow}/${configuredProblemSlots} problems active`
                       : data.campaign.status === "budget-exhausted"
                         ? data.campaign.provider === "pro"
                           ? "Work is saved; raise the API limit to continue"
@@ -1526,7 +1553,7 @@ export default function AutoproverDashboard() {
                 <p>
                   {workingNow} working · {stateCounts.solved} solved ·{" "}
                   {stateCounts["human-review"]} human review ·{" "}
-                  {notSolvedCount} not solved
+                  {stateCounts.saved} saved · {notSolvedCount} not solved
                 </p>
               </div>
               <details className="manageProblems">

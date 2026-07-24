@@ -589,7 +589,7 @@ export class Autoprover {
         (entry) => entry.informationGain,
       );
       for (const entry of epochResults.filter(
-        (entry) => entry?.candidate?.present,
+        (entry) => isCompleteCandidate(entry?.candidate),
       )) {
         this.enqueueCandidate(
           problemState,
@@ -678,6 +678,42 @@ export class Autoprover {
   }
 
   enqueueCandidate(problemState, branchId, candidate) {
+    if (!isCompleteCandidate(candidate)) {
+      if (candidate?.present) {
+        problemState.partialLeads ??= [];
+        const leadHash = sha256(
+          JSON.stringify({
+            problem: problemState.packet.statement,
+            kind: candidate.kind,
+            claim: candidate.claim,
+            solution: candidate.solution,
+          }),
+        );
+        if (
+          !problemState.partialLeads.some(
+            (entry) => entry.leadHash === leadHash,
+          )
+        ) {
+          problemState.partialLeads.push({
+            leadHash,
+            branchId,
+            claim: candidate.claim,
+            solution: candidate.solution,
+            verificationPlan: candidate.verificationPlan,
+            recordedAt: nowIso(),
+            status: "saved-unverified-lead",
+          });
+        }
+        const branch = branchId
+          ? problemState.branches.find((entry) => entry.id === branchId)
+          : null;
+        if (branch) {
+          branch.feedback =
+            "This is useful saved research, but it is not a complete solution. Continue the same thread toward a full proof or disproof; do not send it to verification yet.";
+        }
+      }
+      return null;
+    }
     problemState.pendingCandidates ??= [];
     const candidateHash = sha256(
       JSON.stringify({
@@ -736,6 +772,48 @@ export class Autoprover {
   async completePendingSynthesis(problemState, problemDir) {
     const round = problemState.pendingSynthesisRound;
     if (round === null || round === undefined) return false;
+    if (
+      this.config.skipSingleBranchSynthesis &&
+      problemState.branches.length === 1
+    ) {
+      const branch = problemState.branches[0];
+      const latest = branch.history.at(-1) ?? null;
+      problemState.sharedState = {
+        verifiedFacts: [...new Set(branch.verifiedFacts)],
+        rejectedClaims: [...new Set(branch.failedApproaches)],
+        portfolioSummary:
+          latest?.summary ??
+          "The persistent root branch has not produced a new state delta.",
+      };
+      problemState.portfolioStagnationRounds =
+        problemState.roundInformationGain
+          ? 0
+          : problemState.portfolioStagnationRounds + 1;
+      this.reframeStalledBranches(problemState);
+      if (
+        problemState.portfolioStagnationRounds >=
+        this.config.maxPortfolioStagnationRounds
+      ) {
+        problemState.pendingExhaustionReason =
+          "The persistent research thread produced no information gain for the configured number of rounds";
+      }
+      await this.store.event("problem.round_completed", {
+        problemId: problemState.packet.id,
+        round,
+        status: problemState.status,
+        portfolioStagnationRounds:
+          problemState.portfolioStagnationRounds,
+        synthesisSkipped: "single-persistent-root",
+      });
+      problemState.pendingSynthesisRound = null;
+      problemState.roundInProgress = false;
+      problemState.roundInformationGain = false;
+      await this.store.save(this.state);
+      if (this.config.roundCooldownSeconds) {
+        await sleep(this.config.roundCooldownSeconds * 1000);
+      }
+      return true;
+    }
     const operationKey = `problem:${problemState.packet.id}:synthesis:${round}`;
     if (!this.operationCanRun(operationKey)) return false;
     const synthesis = await this.callModel({
@@ -927,6 +1005,11 @@ export class Autoprover {
   }
 
   async verifyCandidate(problemState, branch, candidate) {
+    if (!isCompleteCandidate(candidate)) {
+      this.enqueueCandidate(problemState, branch?.id ?? null, candidate);
+      await this.store.save(this.state);
+      return false;
+    }
     const candidateHash = sha256(JSON.stringify({ problem: problemState.packet.statement, candidate }));
     let verificationRun = problemState.verificationRuns.find(
       (run) => run.candidateHash === candidateHash,
@@ -1316,9 +1399,11 @@ export class Autoprover {
   }
 
   async applyTwelveHourExtensionGate(problemState) {
+    const gateHours = Number(this.config.extensionGateHours ?? 0);
     if (
-      this.config.wallClockHours <= 12 ||
-      problemActiveHours(problemState) < 12
+      gateHours <= 0 ||
+      this.config.wallClockHours <= gateHours ||
+      problemActiveHours(problemState) < gateHours
     ) {
       return false;
     }
@@ -1358,7 +1443,7 @@ export class Autoprover {
     };
     if (!passed) {
       problemState.status = "exhausted-no-result";
-      problemState.stopReason = "The 12-hour extension gate found no reproducible candidate, verified partial result, or evidence-bearing anomaly";
+      problemState.stopReason = `The ${gateHours}-hour extension gate found no reproducible candidate or evidence-bearing anomaly`;
     }
     await this.store.event("problem.extension_gate", {
       problemId: problemState.packet.id,
@@ -1409,6 +1494,14 @@ export function normalizeProblem(problem) {
     falsificationType: falsification.type,
     counterexampleSearchability: falsification.searchability,
     counterexampleVerificationPlan: falsification.assessment,
+    minimumDecisiveArtifact: String(
+      problem.minimumDecisiveArtifact ??
+        defaultMinimumDecisiveArtifact(problem.verificationMode),
+    ),
+    artifactReadiness: normalizeArtifactReadiness(problem),
+    blockingDependencies: Array.isArray(problem.blockingDependencies)
+      ? problem.blockingDependencies
+      : [],
     whyPromising: String(problem.whyPromising ?? ""),
     risks: Array.isArray(problem.risks) ? problem.risks : [],
     priorResearch: Array.isArray(problem.priorResearch)
@@ -1481,6 +1574,37 @@ export function validateProblemPacket(problem) {
       );
     }
   }
+  if (
+    problem.artifactReadiness !== undefined &&
+    (
+      !Number.isInteger(problem.artifactReadiness) ||
+      problem.artifactReadiness < 1 ||
+      problem.artifactReadiness > 5
+    )
+  ) {
+    throw new Error(
+      `Problem ${problem.id} artifactReadiness must be an integer from 1 to 5`,
+    );
+  }
+  if (
+    problem.minimumDecisiveArtifact !== undefined &&
+    (
+      typeof problem.minimumDecisiveArtifact !== "string" ||
+      !problem.minimumDecisiveArtifact.trim()
+    )
+  ) {
+    throw new Error(
+      `Problem ${problem.id} needs a minimumDecisiveArtifact`,
+    );
+  }
+  if (
+    problem.blockingDependencies !== undefined &&
+    !Array.isArray(problem.blockingDependencies)
+  ) {
+    throw new Error(
+      `Problem ${problem.id} blockingDependencies must be an array`,
+    );
+  }
   return true;
 }
 
@@ -1499,6 +1623,15 @@ function applyVetting(problem, vetting) {
     counterexampleVerificationPlan:
       vetting.counterexampleAssessment ??
       problem.counterexampleVerificationPlan,
+    minimumDecisiveArtifact:
+      vetting.correctedMinimumDecisiveArtifact ??
+      problem.minimumDecisiveArtifact,
+    artifactReadiness:
+      vetting.correctedArtifactReadiness ??
+      problem.artifactReadiness,
+    blockingDependencies:
+      vetting.blockingDependencies ??
+      problem.blockingDependencies,
     vetting,
   };
   corrected.statementHash = sha256(corrected.statement);
@@ -1518,7 +1651,7 @@ function discoverySelectionEntry(problem) {
     problemKey: problem.statementHash,
     packet: problem,
     ranking: {
-      priority: problemScore(problem) / 5.4,
+      priority: problemScore(problem) / 6,
     },
     attempts: [],
   };
@@ -1526,12 +1659,19 @@ function discoverySelectionEntry(problem) {
 
 export function problemScore(problem) {
   const falsification = counterexampleOpportunity(problem);
+  const readiness = normalizeArtifactReadiness(problem);
+  const blockingPenalty = Math.min(
+    1.5,
+    (problem.blockingDependencies?.length ?? 0) * 0.5,
+  );
   return (
-    0.32 * problem.tractability +
-    0.28 * problem.verifiability +
-    0.2 * problem.interest +
-    0.2 * problem.sourceQuality +
-    0.4 * falsification.opportunity
+    0.26 * problem.tractability +
+    0.24 * problem.verifiability +
+    0.18 * problem.interest +
+    0.16 * problem.sourceQuality +
+    0.28 * readiness +
+    0.36 * falsification.opportunity -
+    blockingPenalty
   );
 }
 
@@ -1571,6 +1711,7 @@ function createProblemState(packet) {
     verificationRuns: [],
     bestCandidate: null,
     pendingCandidates: [],
+    partialLeads: [],
     pendingSynthesisRound: null,
     roundInProgress: false,
     roundInformationGain: false,
@@ -1702,6 +1843,7 @@ function migrateState(state) {
     problem.evidenceKeys ??= [];
     problem.verificationRuns ??= [];
     problem.pendingCandidates ??= [];
+    problem.partialLeads ??= [];
     problem.pendingSynthesisRound ??= null;
     problem.roundInProgress ??= false;
     problem.roundInformationGain ??= false;
@@ -1795,6 +1937,38 @@ function isProblemTerminal(status) {
     "budget-exhausted",
     "blocked",
   ].includes(status);
+}
+
+function isCompleteCandidate(candidate) {
+  return (
+    candidate?.present === true &&
+    ["proof", "disproof"].includes(candidate.kind)
+  );
+}
+
+function defaultMinimumDecisiveArtifact(verificationMode) {
+  if (verificationMode === "finite-witness") {
+    return "An exact finite witness together with an independently executable checker.";
+  }
+  if (verificationMode === "exact-computation") {
+    return "A complete exact computation, its source code or certificate, and an independent reproduction procedure.";
+  }
+  if (verificationMode === "formalizable") {
+    return "A complete proof or disproof with every imported theorem and hypothesis identified for formal checking.";
+  }
+  return "A complete proof or disproof of the exact statement with a line-by-line independent verification plan.";
+}
+
+function normalizeArtifactReadiness(problem) {
+  const explicit = Number(problem.artifactReadiness);
+  if (Number.isInteger(explicit) && explicit >= 1 && explicit <= 5) {
+    return explicit;
+  }
+  if (problem.verificationMode === "finite-witness") return 5;
+  if (problem.verificationMode === "exact-computation") return 4;
+  if (problem.verificationMode === "formalizable") return 3;
+  if (problem.verificationMode === "informal-proof") return 2;
+  return 1;
 }
 
 function startProblemClock(problem) {

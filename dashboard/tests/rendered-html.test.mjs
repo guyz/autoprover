@@ -23,7 +23,7 @@ async function render() {
   );
 }
 
-test("server-renders the Autoprover campaign control room", async () => {
+test("server-renders the Autoprover problem dashboard", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -34,17 +34,17 @@ test("server-renders the Autoprover campaign control room", async () => {
     /<title>Continuous Math Research · Autoprover<\/title>/i,
   );
   assert.match(html, />Autoprover</);
-  assert.match(html, /Campaign control/);
+  assert.match(html, /aria-label="Campaign status"/);
   assert.match(html, />Problems</);
-  assert.match(html, /Research notes/);
-  assert.match(html, /Preview · connecting|Connecting/);
+  assert.match(html, />Activity</);
+  assert.match(html, />Connecting</);
   assert.match(html, /Connecting to the controller/);
   assert.doesNotMatch(html, /Lonely Runner Conjecture/);
   assert.match(html, /autoprover-og\.png/);
   assert.doesNotMatch(html, /Your site is taking shape|Building your site/);
 });
 
-test("keeps campaign controls, completed reports, and metadata wired", async () => {
+test("keeps compact controls, problem states, and metadata wired", async () => {
   const [component, page, layout, packageJson] = await Promise.all([
     readFile(
       new URL("../app/components/AutoproverDashboard.tsx", import.meta.url),
@@ -59,19 +59,24 @@ test("keeps campaign controls, completed reports, and metadata wired", async () 
   assert.match(component, /x-autoprover-command-token/);
   assert.match(component, /completedProblems/);
   assert.match(component, /recentProcessNotes/);
-  assert.match(component, /Highest priority first/);
-  assert.match(component, /Counterexample route:/);
+  assert.match(component, /Checking a candidate now/);
+  assert.match(component, /Verification stopped at the budget/);
+  assert.match(component, /not accepted as a solution/);
   assert.match(component, /\/api\/catalog\/discover/);
   assert.match(component, /\/api\/catalog\/suggest/);
   assert.match(component, /\/api\/catalog\/prioritize/);
   assert.match(component, /\/api\/attempt\/switch/);
   assert.match(component, /Find more problems/);
-  assert.match(component, /Run next/);
-  assert.match(component, /Move to another problem/);
-  assert.match(component, /Earlier work is preserved/);
-  assert.match(component, /Resume saved work for/);
-  assert.match(component, /Pause after current calls/);
-  assert.match(component, /Approaches for this problem/);
+  assert.match(component, /Run this problem next/);
+  assert.match(component, /Stop this attempt and pick another/);
+  assert.match(component, /Resume for/);
+  assert.match(component, /"Pause"/);
+  assert.match(component, /Approaches running now/);
+  assert.match(component, /Attempt history/);
+  assert.match(component, /Manage list/);
+  assert.doesNotMatch(component, /Highest priority first/);
+  assert.doesNotMatch(component, /Counterexample route:/);
+  assert.doesNotMatch(component, /Earlier work is preserved/);
   assert.match(page, /<AutoproverDashboard \/>/);
   assert.match(layout, /autoprover-og\.png/);
   assert.match(layout, /openGraph:/);

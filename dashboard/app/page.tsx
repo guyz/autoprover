@@ -4,7 +4,7 @@ import AutoproverDashboard from "./components/AutoproverDashboard";
 export const metadata: Metadata = {
   title: "Continuous Math Research",
   description:
-    "Run, rank, and inspect parallel AI research campaigns against open mathematical problems.",
+    "See which open mathematical problems are being worked on, verified, solved, or left unresolved.",
 };
 
 export default function Home() {

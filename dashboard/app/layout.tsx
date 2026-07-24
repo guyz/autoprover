@@ -34,7 +34,7 @@ export async function generateMetadata(): Promise<Metadata> {
   }
   const socialImage = `${origin}/autoprover-og.png`;
   const description =
-    "A control room for continuous, parallel AI research on open mathematical problems.";
+    "A live, readable view of AI agents working on open mathematical problems.";
 
   return {
     metadataBase: new URL(origin),

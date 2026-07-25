@@ -12,6 +12,7 @@ import {
 } from "../utils.mjs";
 import {
   buildSubscriptionChildEnvironment,
+  createSuspensionAwareTimeout,
   registerChildProcessCleanup,
   settleWithin,
 } from "./child-runtime.mjs";
@@ -217,17 +218,18 @@ export function runProcess({
     };
 
     const clearTimers = () => {
-      if (timer) clearTimeout(timer);
+      timer?.clear?.();
       if (forceKillTimer) clearTimeout(forceKillTimer);
     };
 
     unregisterProcessCleanup = registerChildProcessCleanup(terminate);
     timer = Number.isFinite(timeoutMs)
-      ? setTimeout(() => {
+      ? createSuspensionAwareTimeout(() => {
           timedOut = true;
           terminate();
         }, Math.max(1, timeoutMs))
       : null;
+    timer?.unref?.();
 
     const consume = (chunk) => {
       stdout += chunk;
@@ -322,7 +324,7 @@ export function runProcess({
     child.stdin.on("error", (error) => {
       if (error.code !== "EPIPE" && !settled) {
         settled = true;
-        if (timer) clearTimeout(timer);
+        timer?.clear?.();
         terminate();
         unregisterProcessCleanup();
         reject(error);

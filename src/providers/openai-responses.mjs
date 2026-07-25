@@ -127,11 +127,18 @@ export class OpenAIResponsesProvider {
       remainingRunMs,
     );
     const deadlineMs = deadlineFromTimeout(timeout);
+    // Always retrieve once, even if a laptop woke after the local wall clock
+    // elapsed. Background Responses work may have completed while the client
+    // was asleep; cancelling before this read would discard a valid result.
+    const initialFetchDeadline =
+      remainingUntil(deadlineMs) > 0
+        ? deadlineMs
+        : Date.now() + Math.min(this.networkTimeoutMs, 15_000);
     let response = await this.requestJson(
       "GET",
       `/responses/${encodeURIComponent(responseId)}`,
       undefined,
-      { deadlineMs },
+      { deadlineMs: initialFetchDeadline },
     );
     while (!terminalStatus(response.status)) {
       const remainingMs = remainingUntil(deadlineMs);

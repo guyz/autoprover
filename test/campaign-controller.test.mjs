@@ -14,6 +14,7 @@ import {
   childResumeExtensionHours,
   packetWithPriorResearch,
   requestCampaignStop,
+  scoreProbeAttempt,
   summarizeChildAttempt,
 } from "../src/campaign.mjs";
 import { loadConfig } from "../src/config.mjs";
@@ -173,6 +174,61 @@ test("campaign projection makes a decisive outcome and never promotes a partial"
   assert.equal(partial.hasVerifiedPartial, true);
 });
 
+test("bounded activity cannot outrank a reusable lemma in tournament scoring", () => {
+  const child = (decisiveProgress, coverageOfExactStatement, artifacts = 0) => ({
+    status: "completed-checkpoint",
+    problems: [
+      {
+        packet: {
+          interest: 5,
+          artifactReadiness: 5,
+        },
+        branches: [
+          {
+            verifiedFacts: Array.from({ length: 20 }, (_, index) => `f${index}`),
+            history: [
+              {
+                at: "2026-07-25T00:00:00.000Z",
+                progressKind: "search-pruning",
+                decisiveProgress,
+                coverageOfExactStatement,
+                summary: "The exact problem remains OPEN after a large bounded search.",
+                nextAction: "deepen",
+                nextActionReason: "Increase the bound.",
+                artifacts: Array.from({ length: artifacts }, (_, index) => ({
+                  kind: "code",
+                  verification: `Run checker ${index}.`,
+                })),
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  });
+  const summary = {
+    outcome: "not-solved",
+    childStatus: "completed-checkpoint",
+    rounds: 1,
+    solverTurns: 1,
+    stageSolverTurns: 1,
+    note: "The exact problem remains open.",
+  };
+  const bounded = scoreProbeAttempt({
+    summary,
+    childState: child("bounded-check", "bounded", 8),
+  });
+  const lemma = scoreProbeAttempt({
+    summary: { ...summary, note: "A named blocker was removed exactly." },
+    childState: child("reusable-lemma", "conditional", 1),
+  });
+
+  assert.ok(bounded.score <= 25);
+  assert.equal(bounded.promotable, false);
+  assert.ok(lemma.score > bounded.score);
+  assert.equal(lemma.promotable, true);
+});
+
 function fixture(schemaName) {
   if (schemaName === "research_portfolio_plan") {
     return {
@@ -195,6 +251,9 @@ function fixture(schemaName) {
     return {
       status: "candidate",
       progressKind: "candidate",
+      decisiveProgress: "complete-candidate",
+      coverageOfExactStatement: "exact",
+      remainingBlockers: [],
       summary: "Found and exactly checked a finite witness.",
       verifiedFacts: ["The witness was evaluated with exact arithmetic."],
       plausibleClaims: [],
@@ -446,7 +505,7 @@ test(
 );
 
 test(
-  "the tournament probes broadly, promotes measured progress, and resumes the same run directories",
+  "the tournament completes probe, follow-up, and deep stages in the same run directories",
   { timeout: 4_000 },
   async (t) => {
     const root = await mkdtemp(
@@ -461,7 +520,9 @@ test(
         tournamentEnabled: true,
         probeProblemCount: 4,
         minimumPromotableProbes: 4,
-        deepProblemCount: 2,
+        semifinalProblemCount: 2,
+        semifinalSolverTurns: 2,
+        deepProblemCount: 1,
         probeHours: 0.01,
       },
     });
@@ -507,6 +568,9 @@ test(
                   {
                     summary: "The probe produced a concrete exact result.",
                     progressKind: "verified-fact",
+                    decisiveProgress: "reusable-lemma",
+                    coverageOfExactStatement: "conditional",
+                    remainingBlockers: ["Extend the lemma to every instance."],
                     nextAction: "deepen",
                     nextActionReason: "Extend the exact result.",
                     artifacts: Array.from(
@@ -534,13 +598,13 @@ test(
 
     await setup.controller.advanceTournamentIfReady();
 
-    assert.equal(setup.controller.state.tournament.stage, "deep");
+    assert.equal(setup.controller.state.tournament.stage, "semifinal");
     assert.equal(
       setup.controller.state.tournament.promotedProblemKeys.length,
       2,
     );
     const promoted = Object.values(setup.controller.state.attempts)
-      .filter((attempt) => attempt.stage === "deep")
+      .filter((attempt) => attempt.stage === "semifinal")
       .sort((left, right) => right.probeScore - left.probeScore);
     assert.equal(promoted.length, 2);
     assert.ok(promoted[0].probeScore > promoted[1].probeScore);
@@ -565,6 +629,192 @@ test(
       ),
       "promotion must resume each finalist's exact probe directory",
     );
+
+    for (const [index, { attempt }] of launches.entries()) {
+      const entry = catalog.entries[attempt.problemKey];
+      const childState = {
+        status: "completed-checkpoint",
+        budget: { callsStarted: 2 },
+        problems: [
+          {
+            packet: entry.packet,
+            status: "completed-checkpoint",
+            round: 2,
+            branches: [
+              {
+                verifiedFacts: ["probe fact", "follow-up fact"],
+                failedApproaches: [],
+                evidenceKeys: [],
+                history: [
+                  {
+                    summary: "The saved probe fact remains valid.",
+                    progressKind: "verified-fact",
+                    decisiveProgress: "reusable-lemma",
+                    coverageOfExactStatement: "conditional",
+                    remainingBlockers: ["Extend it."],
+                    nextAction: "deepen",
+                    nextActionReason: "Continue the exact route.",
+                    artifacts: [],
+                  },
+                  {
+                    summary: "The follow-up produced an exact structural route.",
+                    progressKind: "verified-fact",
+                    decisiveProgress:
+                      index === 0 ? "exact-reduction" : "reusable-lemma",
+                    coverageOfExactStatement: "conditional",
+                    remainingBlockers: ["Complete the final implication."],
+                    nextAction: "deepen",
+                    nextActionReason: "Close the remaining implication.",
+                    artifacts: [
+                      {
+                        kind: "proof",
+                        verification: "Check every equivalence in the reduction.",
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+            verificationRuns: [],
+          },
+        ],
+      };
+      const summary = summarizeChildAttempt(attempt, childState);
+      summary.stageSolverTurns = 1;
+      await setup.controller.checkpointProbeAttempt(
+        attempt,
+        childState,
+        summary,
+      );
+    }
+
+    await setup.controller.advanceTournamentIfReady();
+    assert.equal(setup.controller.state.tournament.stage, "deep");
+    assert.equal(
+      setup.controller.state.tournament.promotedProblemKeys.length,
+      1,
+    );
+    launches.length = 0;
+    await setup.controller.fillAvailableSlots();
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].options.resume, true);
+    const deepAttempt = launches[0].attempt;
+    assert.equal(deepAttempt.runDir, runDirs.get(deepAttempt.problemKey));
+
+    const deepEntry = catalog.entries[deepAttempt.problemKey];
+    const deepChildState = {
+      status: "completed-checkpoint",
+      budget: { callsStarted: 4 },
+      problems: [
+        {
+          packet: deepEntry.packet,
+          status: "completed-checkpoint",
+          round: 4,
+          branches: [
+            {
+              verifiedFacts: ["probe", "follow-up", "deep"],
+              failedApproaches: [],
+              evidenceKeys: [],
+              history: Array.from({ length: 4 }, (_, index) => ({
+                summary: `Exact route checkpoint ${index + 1}.`,
+                progressKind: "verified-fact",
+                decisiveProgress: "exact-reduction",
+                coverageOfExactStatement: "conditional",
+                remainingBlockers: ["The final implication remains open."],
+                nextAction: "deepen",
+                nextActionReason: "Try to close the final implication.",
+                artifacts: [],
+              })),
+            },
+          ],
+          verificationRuns: [],
+        },
+      ],
+    };
+    const deepSummary = summarizeChildAttempt(deepAttempt, deepChildState);
+    deepSummary.stageSolverTurns = 2;
+    await setup.controller.checkpointProbeAttempt(
+      deepAttempt,
+      deepChildState,
+      deepSummary,
+    );
+    await setup.controller.advanceTournamentIfReady();
+
+    assert.equal(setup.controller.state.tournament.stage, "probing");
+    assert.equal(setup.controller.state.tournament.round, 2);
+    assert.equal(deepAttempt.status, "completed");
+    assert.equal(deepAttempt.outcome, "not-solved");
+    assert.equal(
+      setup.controller.state.tournament.evaluations.length,
+      3,
+      "each allocation stage should leave a strategy evaluation receipt",
+    );
+  },
+);
+
+test(
+  "an interrupted zero-turn probe retries the same run and is not counted as explored",
+  { timeout: 4_000 },
+  async (t) => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "autoprover-campaign-probe-retry-"),
+    );
+    t.after(() => rm(root, { recursive: true, force: true }));
+    const setup = await campaignFixture(root, {
+      problems: [problem(1)],
+      parallelProblems: 1,
+      policy: {
+        tournamentEnabled: true,
+        probeProblemCount: 1,
+        minimumPromotableProbes: 1,
+        semifinalProblemCount: 1,
+        deepProblemCount: 1,
+        maxStageRetries: 1,
+      },
+    });
+    await setup.controller.mergeCatalogProblems([problem(1)], {
+      source: "probe-retry-test",
+      vetted: true,
+    });
+    const catalog = await setup.controller.store.loadCatalog();
+    const entry = Object.values(catalog.entries)[0];
+    const attempt = await setup.controller.startAttempt(
+      setup.controller.state.slots[0],
+      entry,
+      { stage: "probe" },
+    );
+    const childState = {
+      status: "completed-with-errors",
+      stopReason: "Solver timed out before returning a state delta.",
+      budget: { callsStarted: 2 },
+      problems: [
+        {
+          packet: entry.packet,
+          status: "failed",
+          stopReason: "Solver timed out before returning a state delta.",
+          branches: [],
+          verificationRuns: [],
+        },
+      ],
+    };
+
+    await setup.controller.projectFinishedAttempt(attempt, childState);
+
+    assert.equal(attempt.status, "retryable");
+    assert.equal(attempt.projectedAt, null);
+    assert.equal(
+      setup.controller.state.tournament.roundProbedProblemKeys.length,
+      0,
+    );
+    const launches = [];
+    setup.controller.launchAttemptWorker = (candidate, options) => {
+      launches.push({ candidate, options });
+    };
+    await setup.controller.fillAvailableSlots();
+    assert.equal(launches.length, 1);
+    assert.equal(launches[0].candidate.attemptId, attempt.attemptId);
+    assert.equal(launches[0].candidate.runDir, attempt.runDir);
+    assert.equal(launches[0].options.resume, true);
   },
 );
 

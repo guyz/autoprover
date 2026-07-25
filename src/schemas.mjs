@@ -227,6 +227,29 @@ export const EPOCH_SCHEMA = {
         type: "string",
         enum: ["verified-fact", "refuted-path", "search-pruning", "candidate", "reframe", "none"],
       },
+      decisiveProgress: {
+        type: "string",
+        enum: [
+          "none",
+          "bounded-check",
+          "proper-subcase",
+          "reusable-lemma",
+          "exact-reduction",
+          "complete-candidate"
+        ],
+      },
+      coverageOfExactStatement: {
+        type: "string",
+        enum: [
+          "none",
+          "examples-only",
+          "bounded",
+          "proper-subclass",
+          "conditional",
+          "exact"
+        ],
+      },
+      remainingBlockers: stringArray,
       summary: nonEmptyString,
       verifiedFacts: stringArray,
       plausibleClaims: stringArray,
@@ -240,6 +263,9 @@ export const EPOCH_SCHEMA = {
     required: [
       "status",
       "progressKind",
+      "decisiveProgress",
+      "coverageOfExactStatement",
+      "remainingBlockers",
       "summary",
       "verifiedFacts",
       "plausibleClaims",

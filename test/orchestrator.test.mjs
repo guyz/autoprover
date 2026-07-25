@@ -77,6 +77,9 @@ class BudgetFanoutProvider extends FakeProvider {
         data: {
           status: "progress",
           progressKind: "search-pruning",
+          decisiveProgress: "bounded-check",
+          coverageOfExactStatement: "bounded",
+          remainingBlockers: ["The unbounded case remains."],
           summary: "Finished one bounded search.",
           verifiedFacts: ["One bounded interval was checked exactly."],
           plausibleClaims: [],
@@ -175,6 +178,9 @@ class LoopWithoutCandidateProvider extends FakeProvider {
         data: {
           status: "progress",
           progressKind: "verified-fact",
+          decisiveProgress: "reusable-lemma",
+          coverageOfExactStatement: "conditional",
+          remainingBlockers: ["Remove the auxiliary hypothesis."],
           summary: "Rechecked the same elementary fact.",
           verifiedFacts: ["The base case holds."],
           plausibleClaims: [],
@@ -210,6 +216,9 @@ class PartialLeadProvider extends FakeProvider {
       data: {
         status: "progress",
         progressKind: "verified-fact",
+        decisiveProgress: "reusable-lemma",
+        coverageOfExactStatement: "conditional",
+        remainingBlockers: ["Complete the final reduction."],
         summary: "A useful lemma was proved, but the full problem remains open.",
         verifiedFacts: ["The bounded auxiliary lemma holds."],
         plausibleClaims: [],
@@ -313,6 +322,9 @@ function fixture(name) {
     return {
       status: "candidate",
       progressKind: "candidate",
+      decisiveProgress: "complete-candidate",
+      coverageOfExactStatement: "exact",
+      remainingBlockers: [],
       summary: "Found and exactly checked n=17.",
       verifiedFacts: ["P(17) evaluates to true."],
       plausibleClaims: [],
@@ -387,6 +399,61 @@ test("end-to-end loop discovers, attacks, and independently verifies a finite ca
   assert.equal(app.state.problems[0].status, "candidate-complete-agent-reproduced");
   assert.equal(app.state.problems[0].verificationRuns[0].passes.length, 2);
   assert.equal(app.state.budget.callsStarted, 6);
+});
+
+test("solver-turn checkpoints finish a probe cleanly and resume the same thread", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-turn-checkpoint-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runDir = path.join(root, "run");
+  const provider = new LoopWithoutCandidateProvider();
+  const config = await loadConfig(null, {
+    runRoot: root,
+    wallClockHours: 1,
+    parallelProblems: 1,
+    branchesPerProblem: 1,
+    maxConcurrentCalls: 1,
+    maxCalls: 20,
+    maxTurnsPerBranch: 8,
+    maxSolverTurnsPerProblem: 1,
+    maxNoProgressEpochs: 8,
+    maxPortfolioStagnationRounds: 8,
+  });
+  const packet = fixture("open_problem_discovery").problems[0];
+  const app = await Autoprover.create({
+    config,
+    provider,
+    providerName: "max",
+    runDir,
+  });
+  await app.seedProblems([packet], { vet: false });
+  await app.run();
+
+  assert.equal(app.state.status, "completed-checkpoint");
+  assert.equal(app.state.problems[0].status, "research-checkpoint");
+  assert.equal(app.state.problems[0].branches[0].history.length, 1);
+  const firstSession = app.state.problems[0].branches[0].sessionId;
+
+  const resumedConfig = await loadConfig(null, {
+    ...config,
+    maxSolverTurnsPerProblem: 2,
+  });
+  const resumed = await Autoprover.resume({
+    config: resumedConfig,
+    provider,
+    providerName: "max",
+    runDir,
+  });
+  await resumed.run();
+
+  assert.equal(resumed.state.status, "completed-checkpoint");
+  assert.equal(resumed.state.problems[0].branches[0].history.length, 2);
+  assert.equal(
+    provider.epochSessionInputs.at(-1),
+    firstSession,
+    "the next solver turn must resume the exact saved session",
+  );
 });
 
 test("partial leads stay in the solver loop and never consume verifier calls", async (t) => {

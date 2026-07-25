@@ -39,6 +39,13 @@ Prefer problems with all of the following:
 - finite witnesses, exact computation, formalization, or sharply testable intermediate lemmas;
 - enough known structure to start, but not a result already settled in the literature.
 
+When an Erdős source lane is supplied below, use it as a live candidate index,
+not as proof that a problem is suitable. Recover each exact statement from its
+current page and original references, confirm that its live status is still
+unresolved, and prefer entries marked decidable, falsifiable, verifiable, or
+formalized when they also have a realistic decisive-artifact route. Do not
+include an entry whose page has changed to proved, disproved, or solved.
+
 The goal is not to predict prestige. The goal is to identify problems for which
 an agent can produce the decisive object. Explicitly assess:
 - the minimum decisive artifact (complete proof text, exact witness, certificate,
@@ -79,6 +86,11 @@ general mathematical fame for operational readiness.
 Set substantiveHumanStudyVerified=true only when papers, surveys, monographs, or an authoritative human-curated source show that mathematicians have seriously studied the exact problem or a clearly matching variant. A machine-generated conjecture list alone does not satisfy this requirement.
 
 Recommend ATTACK only when the exact statement, current open status, source quality, and substantive human study are adequately supported. Supply corrected wording and assumptions when needed.
+
+An executable search that can merely test larger bounds is not operational
+readiness for an unbounded theorem. Recommend ATTACK only if the route can
+plausibly produce a complete witness, a completeness certificate, an exact
+reduction, or a reusable lemma that materially closes the exact statement.
 `;
 }
 
@@ -153,6 +165,23 @@ ${feedback || "None yet."}
 </critic_or_coordinator_feedback>
 
 End with a state delta, not a diary. Only list a fact as verified when you can identify its evidence. Include complete code, exact witnesses, or proof text needed to reproduce any candidate in the artifact fields.
+
+Classify the strongest new result with decisiveProgress:
+- NONE: no new checkable mathematical information;
+- BOUNDED-CHECK: examples or a finite range only;
+- PROPER-SUBCASE: a rigorously resolved subclass that does not cover the exact
+  statement;
+- REUSABLE-LEMMA: a proved lemma that removes a named blocker in the exact
+  problem;
+- EXACT-REDUCTION: the exact problem is reduced to a finite/checkable condition
+  or an equivalent statement with a realistic completion path;
+- COMPLETE-CANDIDATE: a complete proof or disproof is present.
+
+Set coverageOfExactStatement honestly. A large computation remains BOUNDED, and
+a result under an added hypothesis remains CONDITIONAL. List the concrete
+remainingBlockers. These fields determine whether this branch receives more
+compute, so optimistic wording without a decisive artifact wastes its own
+budget.
 
 Set candidate.present=true only for a complete proof or complete disproof of the
 exact stated problem. A lemma, bounded search, promising reduction, numerical

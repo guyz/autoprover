@@ -70,6 +70,11 @@ export function validateConfig(config) {
   ]) {
     integer(key, config[key]);
   }
+  integer(
+    "maxSolverTurnsPerProblem",
+    config.maxSolverTurnsPerProblem ?? 0,
+    true,
+  );
   positive("maxEstimatedUsd", config.maxEstimatedUsd, true);
   positive("roundCooldownSeconds", config.roundCooldownSeconds, true);
   positive("extensionGateHours", config.extensionGateHours ?? 0, true);
@@ -124,12 +129,49 @@ export function validateConfig(config) {
     config.campaign.tournament.probeHours,
   );
   integer(
+    "campaign.tournament.probeSolverTurns",
+    config.campaign.tournament.probeSolverTurns,
+  );
+  integer(
     "campaign.tournament.minimumPromotableProbes",
     config.campaign.tournament.minimumPromotableProbes,
   );
   integer(
+    "campaign.tournament.semifinalProblemCount",
+    config.campaign.tournament.semifinalProblemCount,
+  );
+  integer(
+    "campaign.tournament.semifinalSolverTurns",
+    config.campaign.tournament.semifinalSolverTurns,
+  );
+  integer(
     "campaign.tournament.deepProblemCount",
     config.campaign.tournament.deepProblemCount,
+  );
+  integer(
+    "campaign.tournament.deepSolverTurns",
+    config.campaign.tournament.deepSolverTurns,
+  );
+  for (const key of ["probePromotionScore", "deepPromotionScore"]) {
+    const value = config.campaign.tournament[key];
+    if (!Number.isFinite(value) || value < 0 || value > 100) {
+      throw new Error(
+        `campaign.tournament.${key} must be a number from 0 to 100`,
+      );
+    }
+  }
+  integer(
+    "campaign.tournament.retryAfterRounds",
+    config.campaign.tournament.retryAfterRounds,
+  );
+  integer(
+    "campaign.tournament.maxStageRetries",
+    config.campaign.tournament.maxStageRetries,
+    true,
+  );
+  positive(
+    "campaign.tournament.stageHardHours",
+    config.campaign.tournament.stageHardHours,
   );
   if (
     config.campaign.tournament.minimumPromotableProbes >
@@ -140,11 +182,29 @@ export function validateConfig(config) {
     );
   }
   if (
-    config.campaign.tournament.deepProblemCount >
+    config.campaign.tournament.semifinalProblemCount >
     config.campaign.tournament.probeProblemCount
   ) {
     throw new Error(
-      "campaign.tournament.deepProblemCount cannot exceed probeProblemCount",
+      "campaign.tournament.semifinalProblemCount cannot exceed probeProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.deepProblemCount >
+    config.campaign.tournament.semifinalProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.deepProblemCount cannot exceed semifinalProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.semifinalSolverTurns <
+      config.campaign.tournament.probeSolverTurns ||
+    config.campaign.tournament.deepSolverTurns <
+      config.campaign.tournament.semifinalSolverTurns
+  ) {
+    throw new Error(
+      "campaign tournament solver-turn targets must increase from probe to semifinal to deep",
     );
   }
   if (
@@ -158,6 +218,18 @@ export function validateConfig(config) {
   integer("discovery.attackCount", config.discovery.attackCount);
   if (config.discovery.attackCount > config.discovery.poolSize) {
     throw new Error("discovery.attackCount cannot exceed discovery.poolSize");
+  }
+  for (const key of ["vettingReserveFraction", "erdosShare"]) {
+    const value = config.discovery[key];
+    if (!Number.isFinite(value) || value < 0 || value > 1) {
+      throw new Error(`discovery.${key} must be a number from 0 to 1`);
+    }
+  }
+  if (
+    typeof config.discovery.erdosIndexUrl !== "string" ||
+    !/^https:\/\//.test(config.discovery.erdosIndexUrl)
+  ) {
+    throw new Error("discovery.erdosIndexUrl must be an HTTPS URL");
   }
   for (const key of [
     "minimumInterest",

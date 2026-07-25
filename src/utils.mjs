@@ -37,6 +37,39 @@ export function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+export function advanceActiveClock(
+  clock,
+  deadlineAt,
+  {
+    nowMs = Date.now(),
+    suspensionThresholdMs = 120_000,
+    expectedTickMs = 1_000,
+  } = {},
+) {
+  const previous = Date.parse(clock?.lastHeartbeatAt ?? "");
+  const currentDeadline = Date.parse(deadlineAt);
+  const gapMs = Number.isFinite(previous)
+    ? Math.max(0, nowMs - previous)
+    : 0;
+  const suspendedMs =
+    gapMs > suspensionThresholdMs
+      ? Math.max(0, gapMs - expectedTickMs)
+      : 0;
+  return {
+    clock: {
+      lastHeartbeatAt: new Date(nowMs).toISOString(),
+      suspendedMs:
+        Math.max(0, Number(clock?.suspendedMs ?? 0)) + suspendedMs,
+      lastSuspensionMs: suspendedMs,
+    },
+    deadlineAt:
+      suspendedMs > 0 && Number.isFinite(currentDeadline)
+        ? new Date(currentDeadline + suspendedMs).toISOString()
+        : deadlineAt,
+    suspendedMs,
+  };
+}
+
 export async function readJson(filePath) {
   return JSON.parse(await readFile(filePath, "utf8"));
 }

@@ -25,6 +25,7 @@ import { RunStore } from "./store.mjs";
 import { assertSchemaValid } from "./providers/pro-manual.mjs";
 import {
   Semaphore,
+  advanceActiveClock,
   nowIso,
   sha256,
   shortId,
@@ -88,6 +89,11 @@ export class Autoprover {
       problems: [],
       operations: {},
       stopReason: "",
+      activeClock: {
+        lastHeartbeatAt: startedAt,
+        suspendedMs: 0,
+        lastSuspensionMs: 0,
+      },
     };
     await store.initialize(state);
     return new Autoprover({
@@ -142,6 +148,7 @@ export class Autoprover {
             "deadline-reached",
             "failed",
             "awaiting-manual",
+            "completed-checkpoint",
             ...(reopenInterrupted ? ["completed-with-errors"] : []),
           ].includes(state.status)
         ) {
@@ -152,6 +159,10 @@ export class Autoprover {
           if (
             ["budget-exhausted", "awaiting-manual"].includes(problem.status) ||
             (problem.status === "deadline-reached" && extendHours > 0) ||
+            (
+              problem.status === "research-checkpoint" &&
+              solverTurnBudgetAvailable(problem, config)
+            ) ||
             (reopenInterrupted && problem.status === "failed")
           ) {
             problem.status = problem.plan ? "active" : "queued";
@@ -181,6 +192,8 @@ export class Autoprover {
   }
 
   async discover() {
+    const stopActiveClock = this.startActiveClock();
+    try {
     this.state.status = "discovering";
     await this.store.save(this.state);
     const currentDate = new Date().toISOString().slice(0, 10);
@@ -211,7 +224,14 @@ export class Autoprover {
       .filter((problem) => problem.tractability >= this.config.discovery.minimumTractability)
       .filter((problem) => problem.verifiability >= this.config.discovery.minimumVerifiability);
 
-    const vetCount = Math.min(eligible.length, Math.max(this.config.discovery.attackCount * 2, this.config.discovery.attackCount));
+    const vettingReserve = Math.ceil(
+      this.config.discovery.attackCount *
+        Number(this.config.discovery.vettingReserveFraction ?? 0.25),
+    );
+    const vetCount = Math.min(
+      eligible.length,
+      this.config.discovery.attackCount + vettingReserve,
+    );
     const vetCandidates = selectProblemPortfolio(
       eligible.map(discoverySelectionEntry),
       {
@@ -298,6 +318,9 @@ export class Autoprover {
     });
     await this.store.save(this.state);
     return selected;
+    } finally {
+      stopActiveClock();
+    }
   }
 
   async seedProblems(problems, { vet = true } = {}) {
@@ -356,9 +379,11 @@ export class Autoprover {
       await this.store.acquireLock();
       this.lockHeld = true;
     }
+    const stopActiveClock = this.startActiveClock();
     try {
       return await this.runLocked();
     } finally {
+      stopActiveClock();
       await this.store.releaseLock();
       this.lockHeld = false;
     }
@@ -424,6 +449,9 @@ export class Autoprover {
     const awaitingManual = this.state.problems.some(
       (problem) => problem.status === "awaiting-manual",
     );
+    const checkpointed = this.state.problems.some(
+      (problem) => problem.status === "research-checkpoint",
+    );
     if (awaitingManual) {
       this.state.status = "awaiting-manual";
       this.state.stopReason =
@@ -436,6 +464,13 @@ export class Autoprover {
       this.state.stopReason = "Call or estimated-cost budget exhausted";
     } else if (failed) {
       this.state.status = hasCandidate ? "completed-with-candidate-and-errors" : "completed-with-errors";
+    } else if (checkpointed) {
+      this.state.status = hasCandidate
+        ? "completed-with-candidate"
+        : "completed-checkpoint";
+      this.state.stopReason = hasCandidate
+        ? this.state.stopReason
+        : "Configured solver-turn checkpoint reached";
     } else {
       this.state.status = hasCandidate ? "completed-with-candidate" : "completed-no-result";
     }
@@ -446,6 +481,12 @@ export class Autoprover {
 
   async runProblem(problemState) {
     if (isProblemTerminal(problemState.status)) return;
+    if (
+      problemState.status === "research-checkpoint" &&
+      !solverTurnBudgetAvailable(problemState, this.config)
+    ) {
+      return;
+    }
     problemState.status = "active";
     problemState.stopReason = "";
     const problemDir = this.store.problemDir(problemState.packet.id);
@@ -524,6 +565,7 @@ export class Autoprover {
     while (
       !isProblemTerminal(problemState.status) &&
       this.problemCanAdvance(problemState) &&
+      solverTurnBudgetAvailable(problemState, this.config) &&
       !this.deadlineReached()
     ) {
       if (await this.applyTwelveHourExtensionGate(problemState)) break;
@@ -615,6 +657,11 @@ export class Autoprover {
       if (this.deadlineReached()) {
         problemState.status = "deadline-reached";
         problemState.stopReason = "Wall-clock deadline reached";
+      } else if (!solverTurnBudgetAvailable(problemState, this.config)) {
+        problemState.status = "research-checkpoint";
+        problemState.stopReason =
+          `Saved after ${problemSolverTurns(problemState)} completed solver ` +
+          `turn${problemSolverTurns(problemState) === 1 ? "" : "s"}`;
       } else if (problemState.pendingExhaustionReason && !problemState.pendingCandidates.length) {
         problemState.status = "exhausted-no-result";
         problemState.stopReason = problemState.pendingExhaustionReason;
@@ -1395,7 +1442,43 @@ export class Autoprover {
   }
 
   deadlineReached() {
+    this.tickActiveClock();
     return Date.now() >= Date.parse(this.state.deadlineAt);
+  }
+
+  startActiveClock() {
+    this.activeClockUsers ??= 0;
+    this.activeClockUsers += 1;
+    if (!this.activeClockTimer) {
+      this.tickActiveClock();
+      this.activeClockTimer = setInterval(
+        () => this.tickActiveClock(),
+        1_000,
+      );
+      this.activeClockTimer.unref?.();
+    }
+    return () => {
+      this.activeClockUsers = Math.max(0, (this.activeClockUsers ?? 1) - 1);
+      if (this.activeClockUsers || !this.activeClockTimer) return;
+      clearInterval(this.activeClockTimer);
+      this.activeClockTimer = null;
+    };
+  }
+
+  tickActiveClock() {
+    const advanced = advanceActiveClock(
+      this.state.activeClock,
+      this.state.deadlineAt,
+    );
+    this.state.activeClock = advanced.clock;
+    this.state.deadlineAt = advanced.deadlineAt;
+    if (advanced.suspendedMs > 0) {
+      this.state.lastSuspension = {
+        at: nowIso(),
+        durationMs: advanced.suspendedMs,
+      };
+    }
+    return advanced.suspendedMs;
   }
 
   async applyTwelveHourExtensionGate(problemState) {
@@ -1814,6 +1897,11 @@ function archiveBranchSession(branch, reason) {
 
 function migrateState(state) {
   state.schemaVersion = 3;
+  state.activeClock ??= {
+    lastHeartbeatAt: state.updatedAt ?? nowIso(),
+    suspendedMs: 0,
+    lastSuspensionMs: 0,
+  };
   state.selectionSeed ??= sha256(
     `${state.runId ?? "run"}:${state.startedAt ?? "legacy"}`,
   );
@@ -1989,6 +2077,18 @@ function problemActiveHours(problem) {
     ? Math.max(0, Date.now() - Date.parse(problem.activeWorkStartedAt))
     : 0;
   return ((problem.activeWorkMs ?? 0) + current) / 3_600_000;
+}
+
+export function problemSolverTurns(problem) {
+  return (problem?.branches ?? []).reduce(
+    (sum, branch) => sum + (branch.history?.length ?? 0),
+    0,
+  );
+}
+
+function solverTurnBudgetAvailable(problem, config) {
+  const limit = Number(config?.maxSolverTurnsPerProblem ?? 0);
+  return limit <= 0 || problemSolverTurns(problem) < limit;
 }
 
 function researchPhase(elapsed) {

@@ -54,6 +54,9 @@ function epoch({ candidate = true } = {}) {
   return {
     status: candidate ? "candidate" : "progress",
     progressKind: candidate ? "candidate" : "verified-fact",
+    decisiveProgress: candidate ? "complete-candidate" : "reusable-lemma",
+    coverageOfExactStatement: candidate ? "exact" : "conditional",
+    remainingBlockers: candidate ? [] : ["Finish the exact statement."],
     summary: candidate ? "Found an exact witness." : "Established one exact fact.",
     verifiedFacts: ["P(17) was evaluated exactly."],
     plausibleClaims: [],

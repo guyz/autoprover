@@ -34,8 +34,27 @@ type Campaign = {
     round: number;
     probeTarget?: number | null;
     probesCompleted?: number;
+    semifinalTarget?: number | null;
+    semifinalsCompleted?: number;
+    deepTarget?: number | null;
+    deepCompleted?: number;
     finalists?: number;
+    latestEvaluation?: {
+      stage: string;
+      problemsCompared: number;
+      solverTurns: number;
+      decisiveLeads: number;
+      verdict: string;
+    } | null;
   } | null;
+  discovery?: {
+    active: boolean;
+    cycle?: number | null;
+    callsRunning: number;
+    callsCompleted: number;
+    callsFailed: number;
+    phase?: string | null;
+  };
   timeLeftMs: number;
   pausedAt?: string | null;
   latestNote?: string;
@@ -525,10 +544,13 @@ function problemHeadline(view: ProblemView) {
       return "Testing a possible proof or counterexample";
     }
     if (live?.stage === "probing solution potential") {
-      return "Short probe measuring concrete progress";
+      return "Completing an initial solver turn";
     }
-    if (live?.stage === "persistent deep solving") {
-      return "Finalist in persistent deep work";
+    if (live?.stage === "testing a promising lead") {
+      return "Testing whether the lead survives another solver turn";
+    }
+    if (live?.stage === "deep solving") {
+      return "Building the strongest lead toward a complete solution";
     }
     const count = live?.branches.length ?? 0;
     return count
@@ -541,7 +563,7 @@ function problemHeadline(view: ProblemView) {
     return "No proof or counterexample was established";
   }
   if (state === "saved") {
-    return "Probe saved; another problem was promoted for deep work";
+    return "Checkpoint saved; a more decisive lead received the next turns";
   }
   return "Waiting to be picked up";
 }
@@ -1207,11 +1229,15 @@ export default function AutoproverDashboard() {
                   <span>
                     {isActive && !campaignProcessRunning
                       ? "Restarting from the last saved checkpoint"
+                      : isActive && data.campaign.discovery?.active
+                        ? `Finding and vetting open problems · ${data.campaign.discovery.callsRunning} model call${data.campaign.discovery.callsRunning === 1 ? "" : "s"} running`
                       : isActive
                       ? data.campaign.tournament?.stage === "probing"
-                        ? `${workingNow}/${configuredProblemSlots} short probes active · ${data.campaign.tournament.probesCompleted ?? 0}/${data.campaign.tournament.probeTarget ?? "?"} compared`
+                        ? `${workingNow}/${configuredProblemSlots} initial solver turns active · ${data.campaign.tournament.probesCompleted ?? 0}/${data.campaign.tournament.probeTarget ?? "?"} compared`
+                        : data.campaign.tournament?.stage === "semifinal"
+                          ? `${workingNow} promising lead${workingNow === 1 ? "" : "s"} active · ${data.campaign.tournament.semifinalsCompleted ?? 0}/${data.campaign.tournament.semifinalTarget ?? "?"} compared`
                         : data.campaign.tournament?.stage === "deep"
-                          ? `${workingNow} finalist${workingNow === 1 ? "" : "s"} in persistent deep work`
+                          ? `${workingNow} strongest lead${workingNow === 1 ? "" : "s"} receiving deeper turns`
                           : `${workingNow}/${configuredProblemSlots} problems active`
                       : data.campaign.status === "budget-exhausted"
                         ? data.campaign.provider === "pro"

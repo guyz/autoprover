@@ -26,9 +26,11 @@ npm run dashboard
 
 Open the printed `http://127.0.0.1:4317/` URL, choose a provider, a 12- or 24-hour limit, and the number of parallel problem slots, then press **Start**. The page polls only the local controller and uses an in-memory command token for mutations. A hosted copy of the UI is a read-only demonstration; it cannot control a process on your computer.
 
-The campaign keeps one persistent, deduplicated catalog under `runs/_catalog/`. When the eligible queue runs low it launches a fresh discovery-and-vetting cycle, records immutable packet versions, and rechecks stale open-status evidence. Discovery requires substantive human mathematical study or an authoritative source; a machine-generated conjecture list alone is not accepted as evidence of interest or open status.
+The campaign keeps one persistent, deduplicated catalog under `runs/_catalog/`. When the eligible queue runs low it launches a fresh discovery-and-vetting cycle, records immutable packet versions, and rechecks stale open-status evidence. Discovery requires substantive human mathematical study or an authoritative source; a machine-generated conjecture list alone is not accepted as evidence of interest or open status. By default, one quarter of each discovery pool is seeded from unresolved entries in the live [Erdős Problems](https://www.erdosproblems.com/) database. Those entries still pass the same exact-statement, current-status, interest, and operational-readiness checks as every other source.
 
-Problem selection is automatic and quality-diverse. A tournament round first runs short probes across the field. It scores measured artifacts, exact facts, search pruning, concrete next actions, blockers, and the problem's decisive-artifact readiness. It then resumes the best-scoring probe directories as persistent deep runs; the losing probes remain saved locally. When the finalists end without a solution and time remains, the controller starts another round on different problems. This works for any number of problem slots and adds no dashboard tuning knob.
+Problem selection is automatic and quality-diverse. A tournament round gives twelve problems one completed solver turn each, gives up to six promising leads a second turn, and gives up to three decisive leads four total turns. Every promotion resumes the same model thread and saved artifacts. Bounded experiments and plausible prose cannot win the tournament by volume: promotion requires a proper subcase, reusable lemma, exact reduction, or complete candidate that applies to the stated problem. A failed or timed-out call with no solver turn is retried and is not counted as an explored problem.
+
+After every stage the controller writes a strategy receipt: calls spent, completed solver turns, zero-turn failures, bounded-only results, decisive leads, and the best and mean scores. A weak round changes the next discovery prompt and rotates to a different portfolio instead of giving arbitrary favorites more compute. Unsolved problems become eligible for a materially reframed retry after later rounds; all earlier work remains available as compact prior research. This is the self-evaluating loop and adds no dashboard tuning knob.
 
 Before a problem enters the tournament, discovery must identify the minimum decisive artifact, whether its inputs and verifier are available now, and any blocking dependency. These operational checks temper the model's speculative tractability score. Catalog selection still uses interest, source quality, counterexample opportunity, coverage, similarity, prior effort, and a durable installation-specific seed so independent installations do not all converge on one favorite.
 
@@ -62,7 +64,7 @@ node src/cli.mjs campaign --yes --resume --extend-hours 12 --continuous
 
 `--max-cycles 0` means discovery can continue until the wall-clock or call/cost guard stops it. A positive value is useful for bounded evaluations. Campaign-global limits are enforced across every child run, so parallel workers cannot each consume the full call budget independently.
 
-`parallelProblems` is the width of a probe round. `maxConcurrentCalls` is the global model-call ceiling. The defaults match at six for the probe, then automatically narrow to two deep finalists. The dashboard names those phases explicitly, so two deep workers are not presented as four broken slots.
+`parallelProblems` is the maximum number of problems worked at once. `maxConcurrentCalls` is the global model-call ceiling. The default tournament contains twelve one-turn probes, up to six two-turn follow-ups, and up to three four-turn deep runs. Available workers refill until the current stage is complete, then the field narrows automatically.
 
 ## Model choice
 
@@ -130,9 +132,10 @@ The import is rejected unless it matches the packet's exact JSON Schema. Packet,
 
 ```text
 discover -> independently vet exact statement/status and artifact readiness
-    -> short probes across a quality-diverse field
-    -> automatically promote measured progress
-    -> resume persistent finalist threads
+    -> 12 one-turn probes across a quality-diverse field
+    -> up to 6 two-turn follow-ups with decisive progress
+    -> up to 3 four-turn deep runs
+    -> score the strategy itself and feed the receipt into discovery
     -> run evidence-producing epochs and internal subagents
         -> deepen / branch / verify / reframe / stop
     -> complete proof/disproof -> blind verifier 1 -> blind verifier 2
@@ -196,7 +199,7 @@ Use `--hours 24` for a fresh 24-hour window:
 node src/cli.mjs run --yes --hours 24 --parallel-problems 2 --max-calls 120 --max-usd 200
 ```
 
-The default tournament does not impose the old hour-12 evidence cutoff. Its short probe is the allocation gate; promoted finalists may use the remaining wall-clock window even when the useful path needs several otherwise uneventful “keep going” turns. Turn, reframe, campaign-time, call, and API-cost limits still apply.
+The default tournament allocates compute by completed solver turns rather than short wall-clock probes: one turn across the field, two turns for promising leads, and four turns for decisive finalists. A full proof or counterexample enters independent verification immediately. Turn, reframe, campaign-time, call, and API-cost limits still apply.
 
 Use an exact manually curated problem packet instead of automatic discovery. `problems.example.json` is a schema-shaped template with placeholder text and an `example.com` URL; it is intentionally rejected until you replace every placeholder with a real, sourced problem:
 

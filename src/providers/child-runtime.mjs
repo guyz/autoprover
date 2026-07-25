@@ -157,6 +157,57 @@ export function settleWithin(promise, timeoutMs, message) {
   });
 }
 
+/**
+ * Measure a model turn in active machine time. A laptop sleep or long
+ * scheduler suspension must not instantly consume the remaining turn budget
+ * when the process wakes.
+ */
+export function createSuspensionAwareTimeout(
+  callback,
+  timeoutMs,
+  {
+    now = Date.now,
+    setIntervalFn = setInterval,
+    clearIntervalFn = clearInterval,
+    tickMs = Math.min(
+      1_000,
+      Math.max(10, Math.floor(Number(timeoutMs) / 20) || 10),
+    ),
+    suspensionThresholdMs = Math.max(5_000, tickMs * 5),
+  } = {},
+) {
+  if (!Number.isFinite(timeoutMs)) {
+    return { clear() {}, unref() {} };
+  }
+  let remainingMs = Math.max(1, Number(timeoutMs));
+  let lastTickAt = now();
+  let cleared = false;
+  let handle;
+  const tick = () => {
+    if (cleared) return;
+    const current = now();
+    const elapsed = Math.max(0, current - lastTickAt);
+    lastTickAt = current;
+    remainingMs -=
+      elapsed > suspensionThresholdMs ? Math.min(elapsed, tickMs) : elapsed;
+    if (remainingMs > 0) return;
+    cleared = true;
+    clearIntervalFn(handle);
+    callback();
+  };
+  handle = setIntervalFn(tick, Math.min(tickMs, remainingMs));
+  return {
+    clear() {
+      if (cleared) return;
+      cleared = true;
+      clearIntervalFn(handle);
+    },
+    unref() {
+      handle?.unref?.();
+    },
+  };
+}
+
 function deleteEnvironmentKey(environment, target) {
   const normalizedTarget = target.toUpperCase();
   for (const key of Object.keys(environment)) {

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   activeVerificationScope,
+  attemptDecision,
   isSolvedVerification,
   verificationRunLabel,
   verificationSummary,
@@ -25,8 +26,8 @@ test("an active partial claim is never presented as a proposed solution", () => 
   const partial = run("partial");
 
   assert.equal(activeVerificationScope([partial]), "partial");
-  assert.equal(verificationRunLabel(partial), "Partial result under review");
-  assert.match(verificationSummary([partial]), /partial result—not a solution/i);
+  assert.equal(verificationRunLabel(partial), "Checking a research note");
+  assert.match(verificationSummary([partial]), /research note/i);
   assert.equal(isSolvedVerification(partial), false);
 });
 
@@ -36,9 +37,12 @@ test("proof and disproof candidates are labeled as proposed solutions", () => {
     assert.equal(activeVerificationScope([candidate]), "solution");
     assert.equal(
       verificationRunLabel(candidate),
-      "Proposed solution under review",
+      "Testing a possible proof or counterexample",
     );
-    assert.match(verificationSummary([candidate]), /proposed solution/i);
+    assert.match(
+      verificationSummary([candidate]),
+      /possible proof or counterexample/i,
+    );
   }
 });
 
@@ -54,11 +58,40 @@ test("only a reproduced complete proof or disproof is solved", () => {
   assert.equal(isSolvedVerification(unclassifiedLegacyResult), false);
   assert.equal(
     verificationRunLabel(verifiedPartial),
-    "Partial result verified",
+    "Partial result saved as research evidence",
   );
   assert.match(
     verificationSummary([verifiedPartial]),
-    /original problem remains open/i,
+    /problem was not solved/i,
+  );
+});
+
+test("public attempt decisions are solved, not solved, or complete-candidate human review", () => {
+  assert.equal(
+    attemptDecision({
+      outcome: "solved",
+      problemStatus: "candidate-complete-agent-reproduced",
+      candidateKind: "disproof",
+      hasCandidate: true,
+    }),
+    "solved",
+  );
+  assert.equal(
+    attemptDecision({
+      outcome: "human-review",
+      problemStatus: "candidate-complete-needs-expert",
+      candidateKind: "proof",
+      hasCandidate: true,
+    }),
+    "human-review",
+  );
+  assert.equal(
+    attemptDecision({
+      outcome: "verified-partial",
+      candidateKind: "partial",
+      hasCandidate: false,
+    }),
+    "not-solved",
   );
 });
 

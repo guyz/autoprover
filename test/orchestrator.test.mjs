@@ -33,6 +33,20 @@ class NeedsExpertProvider extends FakeProvider {
   }
 }
 
+class MachineGeneratedOnlyProvider extends FakeProvider {
+  async run(request) {
+    const result = await super.run(request);
+    if (request.schema.name === "problem_vetting") {
+      result.data.substantiveHumanStudyVerified = false;
+      result.data.recommendation = "reject";
+      result.data.materialErrors = [
+        "The only provenance is an automatically generated conjecture list.",
+      ];
+    }
+    return result;
+  }
+}
+
 class BudgetFanoutProvider extends FakeProvider {
   constructor() {
     super();
@@ -63,6 +77,9 @@ class BudgetFanoutProvider extends FakeProvider {
         data: {
           status: "progress",
           progressKind: "search-pruning",
+          decisiveProgress: "bounded-check",
+          coverageOfExactStatement: "bounded",
+          remainingBlockers: ["The unbounded case remains."],
           summary: "Finished one bounded search.",
           verifiedFacts: ["One bounded interval was checked exactly."],
           plausibleClaims: [],
@@ -76,6 +93,70 @@ class BudgetFanoutProvider extends FakeProvider {
       };
     }
     return super.run(request);
+  }
+}
+
+class RedundantPlannerProvider extends FakeProvider {
+  async run(request) {
+    if (request.schema.name !== "research_portfolio_plan") {
+      return super.run(request);
+    }
+    this.count += 1;
+    const sessionId = `fake-${this.count}`;
+    await request.onStarted?.(sessionId);
+    const exact = {
+      id: "exact-search",
+      title: "Exact bounded search",
+      hypothesis: "A small witness exists.",
+      predictedObservation: "An exact witness appears.",
+      falsifier: "An exact checker rejects every case.",
+      noveltyVector: ["bounded exact search"],
+      preferredTools: ["python"],
+    };
+    return {
+      sessionId,
+      usage: {
+        inputTokens: 100,
+        cachedInputTokens: 0,
+        outputTokens: 50,
+        reasoningTokens: 10,
+      },
+      data: {
+        baseline: "Search exactly.",
+        acceptanceContract: "Produce a checked witness.",
+        strategies: [
+          exact,
+          { ...exact, id: "exact-search-renamed" },
+          {
+            id: "spectral",
+            title: "Spectral obstruction",
+            hypothesis: "An eigenvalue inequality is decisive.",
+            predictedObservation: "A forbidden spectrum is forced.",
+            falsifier: "A checked matrix violates the inequality.",
+            noveltyVector: ["spectral representation"],
+            preferredTools: ["sage"],
+          },
+          {
+            id: "sat",
+            title: "Proof-carrying SAT",
+            hypothesis: "The exact encoding is unsatisfiable.",
+            predictedObservation: "A checked UNSAT certificate appears.",
+            falsifier: "A satisfying model passes the exact checker.",
+            noveltyVector: ["proof carrying sat"],
+            preferredTools: ["cadical"],
+          },
+          {
+            id: "probabilistic",
+            title: "Probabilistic construction",
+            hypothesis: "A random construction succeeds.",
+            predictedObservation: "A moment bound gives positive probability.",
+            falsifier: "An exact dependency calculation defeats the bound.",
+            noveltyVector: ["probabilistic construction"],
+            preferredTools: ["symbolic algebra"],
+          },
+        ],
+      },
+    };
   }
 }
 
@@ -97,6 +178,9 @@ class LoopWithoutCandidateProvider extends FakeProvider {
         data: {
           status: "progress",
           progressKind: "verified-fact",
+          decisiveProgress: "reusable-lemma",
+          coverageOfExactStatement: "conditional",
+          remainingBlockers: ["Remove the auxiliary hypothesis."],
           summary: "Rechecked the same elementary fact.",
           verifiedFacts: ["The base case holds."],
           plausibleClaims: [],
@@ -110,6 +194,55 @@ class LoopWithoutCandidateProvider extends FakeProvider {
       };
     }
     return super.run(request);
+  }
+}
+
+class PartialLeadProvider extends FakeProvider {
+  async run(request) {
+    if (request.schema.name !== "research_epoch_result") {
+      return super.run(request);
+    }
+    this.count += 1;
+    const sessionId = `partial-${this.count}`;
+    await request.onStarted?.(sessionId);
+    return {
+      sessionId,
+      usage: {
+        inputTokens: 10,
+        cachedInputTokens: 0,
+        outputTokens: 10,
+        reasoningTokens: 0,
+      },
+      data: {
+        status: "progress",
+        progressKind: "verified-fact",
+        decisiveProgress: "reusable-lemma",
+        coverageOfExactStatement: "conditional",
+        remainingBlockers: ["Complete the final reduction."],
+        summary: "A useful lemma was proved, but the full problem remains open.",
+        verifiedFacts: ["The bounded auxiliary lemma holds."],
+        plausibleClaims: [],
+        failedApproaches: [],
+        unresolvedQuestions: ["Extend the lemma to the unbounded case."],
+        artifacts: [
+          {
+            name: "bounded-lemma",
+            kind: "lemma",
+            content: "Proof of the bounded auxiliary lemma.",
+            verification: "Check the displayed induction.",
+          },
+        ],
+        candidate: {
+          present: true,
+          kind: "partial",
+          claim: "The bounded auxiliary lemma holds.",
+          solution: "Induction proves the bounded auxiliary statement.",
+          verificationPlan: "Check the induction.",
+        },
+        nextAction: "deepen",
+        nextActionReason: "Use the lemma on the remaining unbounded case.",
+      },
+    };
   }
 }
 
@@ -135,6 +268,10 @@ function fixture(name) {
           counterexampleSearchability: 5,
           counterexampleVerificationPlan:
             "Enumerate exact integer candidates and independently evaluate P.",
+          minimumDecisiveArtifact:
+            "One explicit integer witness with a reproducible exact evaluation of P.",
+          artifactReadiness: 5,
+          blockingDependencies: [],
           whyPromising: "A witness is decisive.",
           risks: [],
         },
@@ -146,6 +283,7 @@ function fixture(name) {
       exactStatementVerified: true,
       openStatusVerified: true,
       sourceQualityVerified: true,
+      substantiveHumanStudyVerified: true,
       correctedStatement: "There is no integer n satisfying P(n).",
       correctedAssumptions: [],
       canonicalSourceUrls: ["https://mathworld.wolfram.com/"],
@@ -156,6 +294,10 @@ function fixture(name) {
       correctedCounterexampleSearchability: 5,
       counterexampleAssessment:
         "The witness space is exactly searchable and each candidate is decisive.",
+      correctedMinimumDecisiveArtifact:
+        "One explicit integer witness with a reproducible exact evaluation of P.",
+      correctedArtifactReadiness: 5,
+      blockingDependencies: [],
       recommendation: "attack",
     };
   }
@@ -180,6 +322,9 @@ function fixture(name) {
     return {
       status: "candidate",
       progressKind: "candidate",
+      decisiveProgress: "complete-candidate",
+      coverageOfExactStatement: "exact",
+      remainingBlockers: [],
       summary: "Found and exactly checked n=17.",
       verifiedFacts: ["P(17) evaluates to true."],
       plausibleClaims: [],
@@ -256,6 +401,105 @@ test("end-to-end loop discovers, attacks, and independently verifies a finite ca
   assert.equal(app.state.budget.callsStarted, 6);
 });
 
+test("solver-turn checkpoints finish a probe cleanly and resume the same thread", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-turn-checkpoint-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const runDir = path.join(root, "run");
+  const provider = new LoopWithoutCandidateProvider();
+  const config = await loadConfig(null, {
+    runRoot: root,
+    wallClockHours: 1,
+    parallelProblems: 1,
+    branchesPerProblem: 1,
+    maxConcurrentCalls: 1,
+    maxCalls: 20,
+    maxTurnsPerBranch: 8,
+    maxSolverTurnsPerProblem: 1,
+    maxNoProgressEpochs: 8,
+    maxPortfolioStagnationRounds: 8,
+  });
+  const packet = fixture("open_problem_discovery").problems[0];
+  const app = await Autoprover.create({
+    config,
+    provider,
+    providerName: "max",
+    runDir,
+  });
+  await app.seedProblems([packet], { vet: false });
+  await app.run();
+
+  assert.equal(app.state.status, "completed-checkpoint");
+  assert.equal(app.state.problems[0].status, "research-checkpoint");
+  assert.equal(app.state.problems[0].branches[0].history.length, 1);
+  const firstSession = app.state.problems[0].branches[0].sessionId;
+
+  const resumedConfig = await loadConfig(null, {
+    ...config,
+    maxSolverTurnsPerProblem: 2,
+  });
+  const resumed = await Autoprover.resume({
+    config: resumedConfig,
+    provider,
+    providerName: "max",
+    runDir,
+  });
+  await resumed.run();
+
+  assert.equal(resumed.state.status, "completed-checkpoint");
+  assert.equal(resumed.state.problems[0].branches[0].history.length, 2);
+  assert.equal(
+    provider.epochSessionInputs.at(-1),
+    firstSession,
+    "the next solver turn must resume the exact saved session",
+  );
+});
+
+test("partial leads stay in the solver loop and never consume verifier calls", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "autoprover-partial-loop-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    branchesPerProblem: 1,
+    maxConcurrentCalls: 1,
+    maxCalls: 4,
+    maxTurnsPerBranch: 2,
+    maxPortfolioStagnationRounds: 8,
+    skipSingleBranchSynthesis: true,
+  });
+  const provider = new PartialLeadProvider();
+  const app = await Autoprover.create({
+    config,
+    provider,
+    providerName: "max",
+    runDir: path.join(root, "run"),
+  });
+  await app.seedProblems(
+    [fixture("open_problem_discovery").problems[0]],
+    { vet: false },
+  );
+
+  await app.run();
+
+  const state = app.state.problems[0];
+  assert.equal(state.branches[0].turns, 2);
+  assert.equal(state.partialLeads.length, 1);
+  assert.equal(state.verificationRuns.length, 0);
+  assert.equal(
+    provider.count,
+    3,
+    "one planner and two persistent solver turns should run",
+  );
+  assert.equal(
+    Object.values(app.state.operations).some(
+      (operation) => operation.role === "critic",
+    ),
+    false,
+  );
+});
+
 test("expert-review recommendations cannot become agent-reproduced candidates", async (t) => {
   const root = await mkdtemp(path.join(os.tmpdir(), "autoprover-expert-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -283,6 +527,35 @@ test("expert-review recommendations cannot become agent-reproduced candidates", 
   await app.run();
   assert.equal(app.state.problems[0].status, "candidate-complete-needs-expert");
   assert.equal(app.state.problems[0].verificationRuns[0].status, "candidate-needs-expert");
+});
+
+test("discovery rejects problems supported only by machine-generated conjecture provenance", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-human-study-gate-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    discovery: {
+      poolSize: 1,
+      attackCount: 1,
+      minimumInterest: 1,
+      minimumTractability: 1,
+      minimumVerifiability: 1,
+    },
+  });
+  const app = await Autoprover.create({
+    config,
+    provider: new MachineGeneratedOnlyProvider(),
+    providerName: "responses",
+    runDir: path.join(root, "run"),
+  });
+  await assert.rejects(
+    () => app.discover(),
+    /no problem whose exact statement, open status, source quality, and substantive human study passed/i,
+  );
+  assert.equal(app.state.problems.length, 0);
 });
 
 test("completed named operations replay without a second provider call or budget charge", async (t) => {
@@ -343,6 +616,52 @@ test("near-budget parallel fanout waits for every started branch before returnin
     1,
   );
   assert.equal(app.state.budget.callsStarted, 4);
+});
+
+test("the planner overgenerates and the harness suppresses duplicate strategy mechanisms", async (t) => {
+  const root = await mkdtemp(
+    path.join(os.tmpdir(), "autoprover-diverse-plan-"),
+  );
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const config = await loadConfig(null, {
+    runRoot: root,
+    parallelProblems: 1,
+    branchesPerProblem: 3,
+    maxConcurrentCalls: 1,
+    maxCalls: 1,
+    discovery: {
+      poolSize: 1,
+      attackCount: 1,
+      minimumInterest: 1,
+      minimumTractability: 1,
+      minimumVerifiability: 1,
+    },
+  });
+  const app = await Autoprover.create({
+    config,
+    provider: new RedundantPlannerProvider(),
+    providerName: "responses",
+    runDir: path.join(root, "run"),
+  });
+  await app.seedProblems(fixture("open_problem_discovery").problems, {
+    vet: false,
+  });
+  await app.run();
+  const problem = app.state.problems[0];
+  assert.equal(problem.branches.length, 3);
+  assert.equal(
+    new Set(
+      problem.branches.map(
+        (branch) => branch.strategy.strategyFingerprint,
+      ),
+    ).size,
+    3,
+  );
+  assert.equal(
+    problem.plan.automaticStrategySelection.suppressedExactDuplicates,
+    1,
+  );
+  assert.equal(problem.plan.automaticStrategySelection.proposedCount, 5);
 });
 
 test("long branches rotate to fresh sessions and repeated evidence stops counting as progress", async (t) => {

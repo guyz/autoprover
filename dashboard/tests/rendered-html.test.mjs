@@ -60,13 +60,12 @@ test("keeps compact controls, problem states, and metadata wired", async () => {
   assert.match(component, /x-autoprover-command-token/);
   assert.match(component, /completedProblems/);
   assert.match(component, /recentProcessNotes/);
-  assert.match(component, /Checking a partial result—not a solution/);
-  assert.match(component, /Checking a proposed proof or disproof/);
-  assert.match(component, /verified partial result/);
-  assert.match(component, /rejected claim/);
-  assert.match(component, /complete proof or disproof appears as Solved/);
+  assert.doesNotMatch(component, /Checking partial|Verified partial/);
+  assert.match(component, /Complete candidate found; human review recommended/);
+  assert.match(component, /No proof or counterexample was established/);
+  assert.match(component, /Autoprover makes a final call: Solved or Not solved/);
   assert.match(statusRules, /not accepted as a solution/);
-  assert.match(statusRules, /original problem remains open/);
+  assert.match(statusRules, /problem was not solved/);
   assert.match(component, /\/api\/catalog\/discover/);
   assert.match(component, /\/api\/catalog\/suggest/);
   assert.match(component, /\/api\/catalog\/prioritize/);

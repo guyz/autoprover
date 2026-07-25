@@ -25,6 +25,7 @@ import { RunStore } from "./store.mjs";
 import { assertSchemaValid } from "./providers/pro-manual.mjs";
 import {
   Semaphore,
+  advanceActiveClock,
   nowIso,
   sha256,
   shortId,
@@ -37,6 +38,12 @@ import {
   counterexampleOpportunity,
   resolveFalsificationProfile,
 } from "./falsification.mjs";
+import {
+  discoveryDiversityBrief,
+  priorStrategyCoverage,
+  selectDiverseStrategies,
+  selectProblemPortfolio,
+} from "./diversity.mjs";
 
 export class Autoprover {
   constructor({ config, provider, providerName, store, state, lockHeld = false }) {
@@ -63,6 +70,9 @@ export class Autoprover {
       startedAt,
       updatedAt: startedAt,
       deadlineAt,
+      selectionSeed: sha256(
+        `${path.basename(runDir)}:${startedAt}:${shortId()}`,
+      ),
       configSnapshot: config,
       budget: {
         callsStarted: 0,
@@ -79,6 +89,11 @@ export class Autoprover {
       problems: [],
       operations: {},
       stopReason: "",
+      activeClock: {
+        lastHeartbeatAt: startedAt,
+        suspendedMs: 0,
+        lastSuspensionMs: 0,
+      },
     };
     await store.initialize(state);
     return new Autoprover({
@@ -133,6 +148,7 @@ export class Autoprover {
             "deadline-reached",
             "failed",
             "awaiting-manual",
+            "completed-checkpoint",
             ...(reopenInterrupted ? ["completed-with-errors"] : []),
           ].includes(state.status)
         ) {
@@ -143,6 +159,10 @@ export class Autoprover {
           if (
             ["budget-exhausted", "awaiting-manual"].includes(problem.status) ||
             (problem.status === "deadline-reached" && extendHours > 0) ||
+            (
+              problem.status === "research-checkpoint" &&
+              solverTurnBudgetAvailable(problem, config)
+            ) ||
             (reopenInterrupted && problem.status === "failed")
           ) {
             problem.status = problem.plan ? "active" : "queued";
@@ -172,6 +192,8 @@ export class Autoprover {
   }
 
   async discover() {
+    const stopActiveClock = this.startActiveClock();
+    try {
     this.state.status = "discovering";
     await this.store.save(this.state);
     const currentDate = new Date().toISOString().slice(0, 10);
@@ -180,7 +202,12 @@ export class Autoprover {
     const scout = await this.callModel({
       operationKey: "discovery:scout",
       role: "scout",
-      prompt: discoveryPrompt(this.config, currentDate),
+      prompt: discoveryPrompt(this.config, currentDate, {
+        diversityBrief: discoveryDiversityBrief(
+          this.state.selectionSeed,
+          this.config.discovery.poolSize,
+        ),
+      }),
       schema: DISCOVERY_SCHEMA,
       workingDir: scoutWorkspace,
       tools: { webSearch: true, codeInterpreter: false },
@@ -195,12 +222,26 @@ export class Autoprover {
     const eligible = rawProblems
       .filter((problem) => problem.interest >= this.config.discovery.minimumInterest)
       .filter((problem) => problem.tractability >= this.config.discovery.minimumTractability)
-      .filter((problem) => problem.verifiability >= this.config.discovery.minimumVerifiability)
-      .sort((a, b) => problemScore(b) - problemScore(a));
+      .filter((problem) => problem.verifiability >= this.config.discovery.minimumVerifiability);
 
-    const vetCount = Math.min(eligible.length, Math.max(this.config.discovery.attackCount * 2, this.config.discovery.attackCount));
+    const vettingReserve = Math.ceil(
+      this.config.discovery.attackCount *
+        Number(this.config.discovery.vettingReserveFraction ?? 0.25),
+    );
+    const vetCount = Math.min(
+      eligible.length,
+      this.config.discovery.attackCount + vettingReserve,
+    );
+    const vetCandidates = selectProblemPortfolio(
+      eligible.map(discoverySelectionEntry),
+      {
+        count: vetCount,
+        seed: this.state.selectionSeed,
+        cycle: "discovery-vetting",
+      },
+    ).map((entry) => entry.packet);
     const vetSettled = await Promise.allSettled(
-      eligible.slice(0, vetCount).map((problem) =>
+      vetCandidates.map((problem) =>
         this.callSemaphore.use(async () => {
           const workspace = path.join(this.store.runDir, "discovery", "vet", slugify(problem.id));
           await mkdir(workspace, { recursive: true });
@@ -240,12 +281,21 @@ export class Autoprover {
       validateProblemPacket(problem);
     }
 
-    const selected = selectDiverse(
-      vetted.filter((problem) => problem.vetting?.recommendation === "attack"),
-      this.config.discovery.attackCount,
+    const selectedEntries = selectProblemPortfolio(
+      vetted
+        .filter((problem) => problem.vetting?.recommendation === "attack")
+        .map(discoverySelectionEntry),
+      {
+        count: this.config.discovery.attackCount,
+        seed: this.state.selectionSeed,
+        cycle: "discovery-attack",
+      },
     );
+    const selected = selectedEntries.map((entry) => entry.packet);
     if (!selected.length) {
-      throw new Error("Discovery produced no problem whose exact statement and open status passed independent vetting");
+      throw new Error(
+        "Discovery produced no problem whose exact statement, open status, source quality, and substantive human study passed independent vetting",
+      );
     }
 
     this.state.discovery = {
@@ -254,6 +304,11 @@ export class Autoprover {
       eligibleCount: eligible.length,
       vetted,
       selectedIds: selected.map((problem) => problem.id),
+      automaticSelection: selectedEntries.map((entry) => ({
+        problemId: entry.packet.id,
+        problemKey: entry.problemKey,
+        ...entry.selection,
+      })),
     };
     this.state.problems = selected.map(createProblemState);
     this.state.status = "ready";
@@ -263,6 +318,9 @@ export class Autoprover {
     });
     await this.store.save(this.state);
     return selected;
+    } finally {
+      stopActiveClock();
+    }
   }
 
   async seedProblems(problems, { vet = true } = {}) {
@@ -321,9 +379,11 @@ export class Autoprover {
       await this.store.acquireLock();
       this.lockHeld = true;
     }
+    const stopActiveClock = this.startActiveClock();
     try {
       return await this.runLocked();
     } finally {
+      stopActiveClock();
       await this.store.releaseLock();
       this.lockHeld = false;
     }
@@ -389,6 +449,9 @@ export class Autoprover {
     const awaitingManual = this.state.problems.some(
       (problem) => problem.status === "awaiting-manual",
     );
+    const checkpointed = this.state.problems.some(
+      (problem) => problem.status === "research-checkpoint",
+    );
     if (awaitingManual) {
       this.state.status = "awaiting-manual";
       this.state.stopReason =
@@ -401,6 +464,13 @@ export class Autoprover {
       this.state.stopReason = "Call or estimated-cost budget exhausted";
     } else if (failed) {
       this.state.status = hasCandidate ? "completed-with-candidate-and-errors" : "completed-with-errors";
+    } else if (checkpointed) {
+      this.state.status = hasCandidate
+        ? "completed-with-candidate"
+        : "completed-checkpoint";
+      this.state.stopReason = hasCandidate
+        ? this.state.stopReason
+        : "Configured solver-turn checkpoint reached";
     } else {
       this.state.status = hasCandidate ? "completed-with-candidate" : "completed-no-result";
     }
@@ -411,23 +481,56 @@ export class Autoprover {
 
   async runProblem(problemState) {
     if (isProblemTerminal(problemState.status)) return;
+    if (
+      problemState.status === "research-checkpoint" &&
+      !solverTurnBudgetAvailable(problemState, this.config)
+    ) {
+      return;
+    }
     problemState.status = "active";
     problemState.stopReason = "";
     const problemDir = this.store.problemDir(problemState.packet.id);
     await mkdir(problemDir, { recursive: true });
 
     if (!problemState.plan) {
+      const proposalCount = Math.max(
+        this.config.branchesPerProblem,
+        Math.min(
+          18,
+          Math.max(
+            this.config.branchesPerProblem * 3,
+            this.config.branchesPerProblem + 4,
+          ),
+        ),
+      );
       const planResult = await this.callModel({
         operationKey: `problem:${problemState.packet.id}:plan`,
         role: "planner",
-        prompt: planPrompt(problemState.packet, this.config.branchesPerProblem),
+        prompt: planPrompt(
+          problemState.packet,
+          proposalCount,
+          this.config.branchesPerProblem,
+        ),
         schema: PLAN_SCHEMA,
         workingDir: path.join(problemDir, "planner"),
         tools: { webSearch: true, codeInterpreter: true },
       });
-      const strategies = planResult.data.strategies.slice(0, this.config.branchesPerProblem);
+      const strategySelection = selectDiverseStrategies(
+        planResult.data.strategies,
+        {
+          count: this.config.branchesPerProblem,
+          seed:
+            `${this.state.selectionSeed}:` +
+            `${problemState.packet.statementHash}:initial-plan`,
+          priorCoverage: priorStrategyCoverage(problemState.packet),
+        },
+      );
+      const strategies = strategySelection.strategies;
       if (!strategies.length) throw new Error(`Planner returned no strategies for ${problemState.packet.title}`);
-      problemState.plan = planResult.data;
+      problemState.plan = {
+        ...planResult.data,
+        automaticStrategySelection: strategySelection.diagnostics,
+      };
       problemState.branches = strategies.map((strategy, index) => createBranch(strategy, index));
       await Promise.all(problemState.branches.map((branch) => this.store.prepareBranch(problemState.packet.id, branch.id)));
       await this.store.event("problem.planned", {
@@ -462,6 +565,7 @@ export class Autoprover {
     while (
       !isProblemTerminal(problemState.status) &&
       this.problemCanAdvance(problemState) &&
+      solverTurnBudgetAvailable(problemState, this.config) &&
       !this.deadlineReached()
     ) {
       if (await this.applyTwelveHourExtensionGate(problemState)) break;
@@ -527,7 +631,7 @@ export class Autoprover {
         (entry) => entry.informationGain,
       );
       for (const entry of epochResults.filter(
-        (entry) => entry?.candidate?.present,
+        (entry) => isCompleteCandidate(entry?.candidate),
       )) {
         this.enqueueCandidate(
           problemState,
@@ -553,6 +657,11 @@ export class Autoprover {
       if (this.deadlineReached()) {
         problemState.status = "deadline-reached";
         problemState.stopReason = "Wall-clock deadline reached";
+      } else if (!solverTurnBudgetAvailable(problemState, this.config)) {
+        problemState.status = "research-checkpoint";
+        problemState.stopReason =
+          `Saved after ${problemSolverTurns(problemState)} completed solver ` +
+          `turn${problemSolverTurns(problemState) === 1 ? "" : "s"}`;
       } else if (problemState.pendingExhaustionReason && !problemState.pendingCandidates.length) {
         problemState.status = "exhausted-no-result";
         problemState.stopReason = problemState.pendingExhaustionReason;
@@ -616,6 +725,42 @@ export class Autoprover {
   }
 
   enqueueCandidate(problemState, branchId, candidate) {
+    if (!isCompleteCandidate(candidate)) {
+      if (candidate?.present) {
+        problemState.partialLeads ??= [];
+        const leadHash = sha256(
+          JSON.stringify({
+            problem: problemState.packet.statement,
+            kind: candidate.kind,
+            claim: candidate.claim,
+            solution: candidate.solution,
+          }),
+        );
+        if (
+          !problemState.partialLeads.some(
+            (entry) => entry.leadHash === leadHash,
+          )
+        ) {
+          problemState.partialLeads.push({
+            leadHash,
+            branchId,
+            claim: candidate.claim,
+            solution: candidate.solution,
+            verificationPlan: candidate.verificationPlan,
+            recordedAt: nowIso(),
+            status: "saved-unverified-lead",
+          });
+        }
+        const branch = branchId
+          ? problemState.branches.find((entry) => entry.id === branchId)
+          : null;
+        if (branch) {
+          branch.feedback =
+            "This is useful saved research, but it is not a complete solution. Continue the same thread toward a full proof or disproof; do not send it to verification yet.";
+        }
+      }
+      return null;
+    }
     problemState.pendingCandidates ??= [];
     const candidateHash = sha256(
       JSON.stringify({
@@ -674,6 +819,48 @@ export class Autoprover {
   async completePendingSynthesis(problemState, problemDir) {
     const round = problemState.pendingSynthesisRound;
     if (round === null || round === undefined) return false;
+    if (
+      this.config.skipSingleBranchSynthesis &&
+      problemState.branches.length === 1
+    ) {
+      const branch = problemState.branches[0];
+      const latest = branch.history.at(-1) ?? null;
+      problemState.sharedState = {
+        verifiedFacts: [...new Set(branch.verifiedFacts)],
+        rejectedClaims: [...new Set(branch.failedApproaches)],
+        portfolioSummary:
+          latest?.summary ??
+          "The persistent root branch has not produced a new state delta.",
+      };
+      problemState.portfolioStagnationRounds =
+        problemState.roundInformationGain
+          ? 0
+          : problemState.portfolioStagnationRounds + 1;
+      this.reframeStalledBranches(problemState);
+      if (
+        problemState.portfolioStagnationRounds >=
+        this.config.maxPortfolioStagnationRounds
+      ) {
+        problemState.pendingExhaustionReason =
+          "The persistent research thread produced no information gain for the configured number of rounds";
+      }
+      await this.store.event("problem.round_completed", {
+        problemId: problemState.packet.id,
+        round,
+        status: problemState.status,
+        portfolioStagnationRounds:
+          problemState.portfolioStagnationRounds,
+        synthesisSkipped: "single-persistent-root",
+      });
+      problemState.pendingSynthesisRound = null;
+      problemState.roundInProgress = false;
+      problemState.roundInformationGain = false;
+      await this.store.save(this.state);
+      if (this.config.roundCooldownSeconds) {
+        await sleep(this.config.roundCooldownSeconds * 1000);
+      }
+      return true;
+    }
     const operationKey = `problem:${problemState.packet.id}:synthesis:${round}`;
     if (!this.operationCanRun(operationKey)) return false;
     const synthesis = await this.callModel({
@@ -865,6 +1052,11 @@ export class Autoprover {
   }
 
   async verifyCandidate(problemState, branch, candidate) {
+    if (!isCompleteCandidate(candidate)) {
+      this.enqueueCandidate(problemState, branch?.id ?? null, candidate);
+      await this.store.save(this.state);
+      return false;
+    }
     const candidateHash = sha256(JSON.stringify({ problem: problemState.packet.statement, candidate }));
     let verificationRun = problemState.verificationRuns.find(
       (run) => run.candidateHash === candidateHash,
@@ -1250,13 +1442,51 @@ export class Autoprover {
   }
 
   deadlineReached() {
+    this.tickActiveClock();
     return Date.now() >= Date.parse(this.state.deadlineAt);
   }
 
+  startActiveClock() {
+    this.activeClockUsers ??= 0;
+    this.activeClockUsers += 1;
+    if (!this.activeClockTimer) {
+      this.tickActiveClock();
+      this.activeClockTimer = setInterval(
+        () => this.tickActiveClock(),
+        1_000,
+      );
+      this.activeClockTimer.unref?.();
+    }
+    return () => {
+      this.activeClockUsers = Math.max(0, (this.activeClockUsers ?? 1) - 1);
+      if (this.activeClockUsers || !this.activeClockTimer) return;
+      clearInterval(this.activeClockTimer);
+      this.activeClockTimer = null;
+    };
+  }
+
+  tickActiveClock() {
+    const advanced = advanceActiveClock(
+      this.state.activeClock,
+      this.state.deadlineAt,
+    );
+    this.state.activeClock = advanced.clock;
+    this.state.deadlineAt = advanced.deadlineAt;
+    if (advanced.suspendedMs > 0) {
+      this.state.lastSuspension = {
+        at: nowIso(),
+        durationMs: advanced.suspendedMs,
+      };
+    }
+    return advanced.suspendedMs;
+  }
+
   async applyTwelveHourExtensionGate(problemState) {
+    const gateHours = Number(this.config.extensionGateHours ?? 0);
     if (
-      this.config.wallClockHours <= 12 ||
-      problemActiveHours(problemState) < 12
+      gateHours <= 0 ||
+      this.config.wallClockHours <= gateHours ||
+      problemActiveHours(problemState) < gateHours
     ) {
       return false;
     }
@@ -1296,7 +1526,7 @@ export class Autoprover {
     };
     if (!passed) {
       problemState.status = "exhausted-no-result";
-      problemState.stopReason = "The 12-hour extension gate found no reproducible candidate, verified partial result, or evidence-bearing anomaly";
+      problemState.stopReason = `The ${gateHours}-hour extension gate found no reproducible candidate or evidence-bearing anomaly`;
     }
     await this.store.event("problem.extension_gate", {
       problemId: problemState.packet.id,
@@ -1347,6 +1577,14 @@ export function normalizeProblem(problem) {
     falsificationType: falsification.type,
     counterexampleSearchability: falsification.searchability,
     counterexampleVerificationPlan: falsification.assessment,
+    minimumDecisiveArtifact: String(
+      problem.minimumDecisiveArtifact ??
+        defaultMinimumDecisiveArtifact(problem.verificationMode),
+    ),
+    artifactReadiness: normalizeArtifactReadiness(problem),
+    blockingDependencies: Array.isArray(problem.blockingDependencies)
+      ? problem.blockingDependencies
+      : [],
     whyPromising: String(problem.whyPromising ?? ""),
     risks: Array.isArray(problem.risks) ? problem.risks : [],
     priorResearch: Array.isArray(problem.priorResearch)
@@ -1419,6 +1657,37 @@ export function validateProblemPacket(problem) {
       );
     }
   }
+  if (
+    problem.artifactReadiness !== undefined &&
+    (
+      !Number.isInteger(problem.artifactReadiness) ||
+      problem.artifactReadiness < 1 ||
+      problem.artifactReadiness > 5
+    )
+  ) {
+    throw new Error(
+      `Problem ${problem.id} artifactReadiness must be an integer from 1 to 5`,
+    );
+  }
+  if (
+    problem.minimumDecisiveArtifact !== undefined &&
+    (
+      typeof problem.minimumDecisiveArtifact !== "string" ||
+      !problem.minimumDecisiveArtifact.trim()
+    )
+  ) {
+    throw new Error(
+      `Problem ${problem.id} needs a minimumDecisiveArtifact`,
+    );
+  }
+  if (
+    problem.blockingDependencies !== undefined &&
+    !Array.isArray(problem.blockingDependencies)
+  ) {
+    throw new Error(
+      `Problem ${problem.id} blockingDependencies must be an array`,
+    );
+  }
   return true;
 }
 
@@ -1437,42 +1706,56 @@ function applyVetting(problem, vetting) {
     counterexampleVerificationPlan:
       vetting.counterexampleAssessment ??
       problem.counterexampleVerificationPlan,
+    minimumDecisiveArtifact:
+      vetting.correctedMinimumDecisiveArtifact ??
+      problem.minimumDecisiveArtifact,
+    artifactReadiness:
+      vetting.correctedArtifactReadiness ??
+      problem.artifactReadiness,
+    blockingDependencies:
+      vetting.blockingDependencies ??
+      problem.blockingDependencies,
     vetting,
   };
   corrected.statementHash = sha256(corrected.statement);
-  if (!vetting.exactStatementVerified || !vetting.openStatusVerified || !vetting.sourceQualityVerified) {
+  if (
+    !vetting.exactStatementVerified ||
+    !vetting.openStatusVerified ||
+    !vetting.sourceQualityVerified ||
+    vetting.substantiveHumanStudyVerified === false
+  ) {
     corrected.vetting = { ...vetting, recommendation: "reject" };
   }
   return corrected;
 }
 
-export function problemScore(problem) {
-  const falsification = counterexampleOpportunity(problem);
-  return (
-    0.32 * problem.tractability +
-    0.28 * problem.verifiability +
-    0.2 * problem.interest +
-    0.2 * problem.sourceQuality +
-    0.4 * falsification.opportunity
-  );
+function discoverySelectionEntry(problem) {
+  return {
+    problemKey: problem.statementHash,
+    packet: problem,
+    ranking: {
+      priority: problemScore(problem) / 6,
+    },
+    attempts: [],
+  };
 }
 
-function selectDiverse(problems, count) {
-  const sorted = [...problems].sort((a, b) => problemScore(b) - problemScore(a));
-  const selected = [];
-  const usedDomains = new Set();
-  for (const problem of sorted) {
-    if (selected.length >= count) break;
-    if (!usedDomains.has(problem.domain)) {
-      selected.push(problem);
-      usedDomains.add(problem.domain);
-    }
-  }
-  for (const problem of sorted) {
-    if (selected.length >= count) break;
-    if (!selected.includes(problem)) selected.push(problem);
-  }
-  return selected;
+export function problemScore(problem) {
+  const falsification = counterexampleOpportunity(problem);
+  const readiness = normalizeArtifactReadiness(problem);
+  const blockingPenalty = Math.min(
+    1.5,
+    (problem.blockingDependencies?.length ?? 0) * 0.5,
+  );
+  return (
+    0.26 * problem.tractability +
+    0.24 * problem.verifiability +
+    0.18 * problem.interest +
+    0.16 * problem.sourceQuality +
+    0.28 * readiness +
+    0.36 * falsification.opportunity -
+    blockingPenalty
+  );
 }
 
 function deduplicateDiscoveredProblems(problems) {
@@ -1511,6 +1794,7 @@ function createProblemState(packet) {
     verificationRuns: [],
     bestCandidate: null,
     pendingCandidates: [],
+    partialLeads: [],
     pendingSynthesisRound: null,
     roundInProgress: false,
     roundInformationGain: false,
@@ -1613,6 +1897,14 @@ function archiveBranchSession(branch, reason) {
 
 function migrateState(state) {
   state.schemaVersion = 3;
+  state.activeClock ??= {
+    lastHeartbeatAt: state.updatedAt ?? nowIso(),
+    suspendedMs: 0,
+    lastSuspensionMs: 0,
+  };
+  state.selectionSeed ??= sha256(
+    `${state.runId ?? "run"}:${state.startedAt ?? "legacy"}`,
+  );
   state.provider = canonicalProviderName(state.provider);
   state.operations ??= {};
   for (const operation of Object.values(state.operations)) {
@@ -1639,6 +1931,7 @@ function migrateState(state) {
     problem.evidenceKeys ??= [];
     problem.verificationRuns ??= [];
     problem.pendingCandidates ??= [];
+    problem.partialLeads ??= [];
     problem.pendingSynthesisRound ??= null;
     problem.roundInProgress ??= false;
     problem.roundInformationGain ??= false;
@@ -1734,6 +2027,38 @@ function isProblemTerminal(status) {
   ].includes(status);
 }
 
+function isCompleteCandidate(candidate) {
+  return (
+    candidate?.present === true &&
+    ["proof", "disproof"].includes(candidate.kind)
+  );
+}
+
+function defaultMinimumDecisiveArtifact(verificationMode) {
+  if (verificationMode === "finite-witness") {
+    return "An exact finite witness together with an independently executable checker.";
+  }
+  if (verificationMode === "exact-computation") {
+    return "A complete exact computation, its source code or certificate, and an independent reproduction procedure.";
+  }
+  if (verificationMode === "formalizable") {
+    return "A complete proof or disproof with every imported theorem and hypothesis identified for formal checking.";
+  }
+  return "A complete proof or disproof of the exact statement with a line-by-line independent verification plan.";
+}
+
+function normalizeArtifactReadiness(problem) {
+  const explicit = Number(problem.artifactReadiness);
+  if (Number.isInteger(explicit) && explicit >= 1 && explicit <= 5) {
+    return explicit;
+  }
+  if (problem.verificationMode === "finite-witness") return 5;
+  if (problem.verificationMode === "exact-computation") return 4;
+  if (problem.verificationMode === "formalizable") return 3;
+  if (problem.verificationMode === "informal-proof") return 2;
+  return 1;
+}
+
 function startProblemClock(problem) {
   problem.activeWorkMs ??= 0;
   problem.activeWorkStartedAt ??= nowIso();
@@ -1752,6 +2077,18 @@ function problemActiveHours(problem) {
     ? Math.max(0, Date.now() - Date.parse(problem.activeWorkStartedAt))
     : 0;
   return ((problem.activeWorkMs ?? 0) + current) / 3_600_000;
+}
+
+export function problemSolverTurns(problem) {
+  return (problem?.branches ?? []).reduce(
+    (sum, branch) => sum + (branch.history?.length ?? 0),
+    0,
+  );
+}
+
+function solverTurnBudgetAvailable(problem, config) {
+  const limit = Number(config?.maxSolverTurnsPerProblem ?? 0);
+  return limit <= 0 || problemSolverTurns(problem) < limit;
 }
 
 function researchPhase(elapsed) {

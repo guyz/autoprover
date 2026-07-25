@@ -14,6 +14,20 @@ export type VerificationRun = {
 
 export type VerificationScope = "solution" | "partial" | "claim";
 
+export type AttemptDecision =
+  | "solved"
+  | "human-review"
+  | "not-solved"
+  | "paused"
+  | "error";
+
+export type AttemptDecisionInput = {
+  outcome?: string | null;
+  problemStatus?: string | null;
+  candidateKind?: string | null;
+  hasCandidate?: boolean;
+};
+
 export const ACTIVE_VERIFICATION_STATES = new Set([
   "checking",
   "running",
@@ -50,6 +64,41 @@ export function isRejectedVerification(run: VerificationRun) {
   return /reject|fail|refut/i.test(run.status);
 }
 
+export function attemptDecision(
+  attempt: AttemptDecisionInput,
+): AttemptDecision {
+  const outcome = String(attempt.outcome ?? "").toLowerCase();
+  const problemStatus = String(attempt.problemStatus ?? "").toLowerCase();
+  const isCompleteCandidate =
+    ["proof", "disproof"].includes(attempt.candidateKind ?? "") ||
+    problemStatus.startsWith("candidate-complete");
+
+  if (
+    isCompleteCandidate &&
+    (
+      problemStatus === "candidate-complete-agent-reproduced" ||
+      ["solved", "agent-reproduced", "agent-reproduced-candidate"].includes(
+        outcome,
+      )
+    )
+  ) {
+    return "solved";
+  }
+  if (
+    isCompleteCandidate &&
+    (
+      problemStatus === "candidate-complete-needs-expert" ||
+      outcome === "human-review" ||
+      attempt.hasCandidate
+    )
+  ) {
+    return "human-review";
+  }
+  if (outcome === "interrupted") return "paused";
+  if (outcome === "failed") return "error";
+  return "not-solved";
+}
+
 export function activeVerificationScope(
   runs: VerificationRun[],
 ): VerificationScope | null {
@@ -67,12 +116,14 @@ export function verificationRunLabel(run: VerificationRun) {
   const scope = verificationScope(run);
   if (isSolvedVerification(run)) return "Solution independently reproduced";
   if (run.status === "verified-partial-lead") {
-    return "Partial result verified";
+    return "Partial result saved as research evidence";
   }
   if (isActiveVerification(run)) {
-    if (scope === "solution") return "Proposed solution under review";
-    if (scope === "partial") return "Partial result under review";
-    return "Research claim under review";
+    if (scope === "solution") {
+      return "Testing a possible proof or counterexample";
+    }
+    if (scope === "partial") return "Checking a research note";
+    return "Checking a research claim";
   }
   if (run.status === "inconclusive-budget-ended") {
     if (scope === "solution") return "Solution check stopped at budget";
@@ -85,10 +136,10 @@ export function verificationRunLabel(run: VerificationRun) {
     return "Research claim rejected";
   }
   if (run.status === "candidate-needs-expert") {
-    return "Proposed solution needs expert review";
+    return "Complete candidate needs human review";
   }
   if (run.status === "partial-needs-expert") {
-    return "Partial result needs expert review";
+    return "Partial result set aside";
   }
   if (run.status === "inconclusive") {
     if (scope === "solution") return "Solution check inconclusive";
@@ -105,10 +156,10 @@ export function verificationSummary(runs: VerificationRun[]) {
 
   const activeScope = activeVerificationScope(runs);
   if (activeScope === "solution") {
-    return "Independent checks are running on a proposed solution.";
+    return "Independent checks are testing a possible proof or counterexample.";
   }
   if (activeScope === "partial") {
-    return "Independent checks are running on a partial result—not a solution.";
+    return "Internal checks are running on a research note. This is not a solution.";
   }
   if (activeScope === "claim") {
     return "Independent checks are running on an unclassified research claim.";
@@ -117,7 +168,7 @@ export function verificationSummary(runs: VerificationRun[]) {
     return "A complete proof or disproof was independently reproduced.";
   }
   if (runs.some((run) => run.status === "verified-partial-lead")) {
-    return "A partial result was verified; the original problem remains open.";
+    return "A partial result passed internal checks and was saved as research context. The problem was not solved.";
   }
 
   const stopped = runs.find(

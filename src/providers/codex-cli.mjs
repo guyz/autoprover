@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -11,16 +12,20 @@ import {
 } from "../utils.mjs";
 import {
   buildSubscriptionChildEnvironment,
+  createSuspensionAwareTimeout,
   registerChildProcessCleanup,
   settleWithin,
 } from "./child-runtime.mjs";
 
 const CHECKPOINT_TIMEOUT_MS = 30_000;
+const MACOS_CHATGPT_CODEX =
+  "/Applications/ChatGPT.app/Contents/Resources/codex";
 
 export class CodexCliProvider {
   constructor(config, options = {}) {
     this.config = config;
-    this.binary = options.binary ?? config.codex.binary;
+    this.binary =
+      options.binary ?? resolveCodexBinary(config.codex.binary);
     this.processRunner = options.processRunner ?? runProcess;
   }
 
@@ -39,15 +44,33 @@ export class CodexCliProvider {
 
     const fullPrompt = `${request.instructions}\n\n${request.prompt}`;
     const resumableSessionId = request.resumeId ?? request.sessionId;
+    const solverEffort =
+      request.role === "solver"
+        ? this.config.codex.effort ?? request.model.effort
+        : request.model.effort ?? this.config.codex.effort;
+    const isolatedWorkerArgs = [
+      // Research workers must not inherit personal plugins, MCP servers, or
+      // connectors from the operator's Codex config. They retain native web
+      // search plus explicitly enabled command-line network access inside the
+      // isolated branch workspace.
+      "--ignore-user-config",
+      ...(request.role === "solver"
+        ? ["--enable", "multi_agent"]
+        : []),
+      ...(this.config.codex.sandbox === "workspace-write"
+        ? ["-c", "sandbox_workspace_write.network_access=true"]
+        : []),
+    ];
     const commandArgs = resumableSessionId
       ? [
           "exec",
+          ...isolatedWorkerArgs,
           "resume",
           resumableSessionId,
           "-m",
           request.model.model,
           "-c",
-          `model_reasoning_effort=\"${request.model.effort ?? this.config.codex.effort}\"`,
+          `model_reasoning_effort=\"${solverEffort}\"`,
           "-c",
           `sandbox_mode=\"${this.config.codex.sandbox}\"`,
           "--output-schema",
@@ -60,10 +83,11 @@ export class CodexCliProvider {
         ]
       : [
           "exec",
+          ...isolatedWorkerArgs,
           "-m",
           request.model.model,
           "-c",
-          `model_reasoning_effort=\"${request.model.effort ?? this.config.codex.effort}\"`,
+          `model_reasoning_effort=\"${solverEffort}\"`,
           "--sandbox",
           this.config.codex.sandbox,
           "--output-schema",
@@ -105,6 +129,27 @@ export class CodexCliProvider {
       response: { stdout: result.stdout, stderr: result.stderr },
     };
   }
+}
+
+export function resolveCodexBinary(
+  configuredBinary,
+  {
+    platform = process.platform,
+    exists = existsSync,
+  } = {},
+) {
+  if (
+    configuredBinary === "codex" &&
+    platform === "darwin" &&
+    exists(MACOS_CHATGPT_CODEX)
+  ) {
+    // The desktop app and CLI share ChatGPT authentication and the model
+    // catalog cache. Prefer the app-bundled CLI so both sides parse the same
+    // cache schema; a separately upgraded Homebrew/npm CLI can otherwise fail
+    // before inference with a stale/incompatible models_cache.json.
+    return MACOS_CHATGPT_CODEX;
+  }
+  return configuredBinary;
 }
 
 export function buildCodexEnvironment({
@@ -173,17 +218,18 @@ export function runProcess({
     };
 
     const clearTimers = () => {
-      if (timer) clearTimeout(timer);
+      timer?.clear?.();
       if (forceKillTimer) clearTimeout(forceKillTimer);
     };
 
     unregisterProcessCleanup = registerChildProcessCleanup(terminate);
     timer = Number.isFinite(timeoutMs)
-      ? setTimeout(() => {
+      ? createSuspensionAwareTimeout(() => {
           timedOut = true;
           terminate();
         }, Math.max(1, timeoutMs))
       : null;
+    timer?.unref?.();
 
     const consume = (chunk) => {
       stdout += chunk;
@@ -260,7 +306,17 @@ export function runProcess({
         return;
       }
       if (code !== 0) {
-        reject(new Error(`Codex exited with code ${code ?? "null"} signal ${signal ?? "none"}: ${stderr.slice(-4000)}`));
+        const diagnostic =
+          extractCodexFailureMessage(stdout) ||
+          stderr.trim().slice(-4000) ||
+          "No diagnostic was emitted";
+        reject(
+          new Error(
+            `Codex exited with code ${code ?? "null"} signal ${
+              signal ?? "none"
+            }: ${diagnostic}`,
+          ),
+        );
         return;
       }
       resolve({ threadId, usage, stdout, stderr });
@@ -268,7 +324,7 @@ export function runProcess({
     child.stdin.on("error", (error) => {
       if (error.code !== "EPIPE" && !settled) {
         settled = true;
-        if (timer) clearTimeout(timer);
+        timer?.clear?.();
         terminate();
         unregisterProcessCleanup();
         reject(error);
@@ -283,4 +339,23 @@ export class CodexCliTimeoutError extends Error {
     super(message);
     this.name = "CodexCliTimeoutError";
   }
+}
+
+export function extractCodexFailureMessage(stdout = "") {
+  const lines = String(stdout).split("\n").reverse();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line);
+      const message =
+        event?.error?.message ??
+        (event?.type === "error" ? event?.message : "");
+      if (typeof message === "string" && message.trim()) {
+        return message.trim().slice(-4000);
+      }
+    } catch {
+      // Codex JSONL can contain ordinary diagnostic lines; ignore them.
+    }
+  }
+  return "";
 }

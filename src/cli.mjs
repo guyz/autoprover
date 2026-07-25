@@ -24,6 +24,7 @@ import {
   validateProblemPacket,
 } from "./orchestrator.mjs";
 import { createProvider } from "./providers/index.mjs";
+import { resolveCodexBinary } from "./providers/codex-cli.mjs";
 import { main as proManualMain } from "./pro-manual-cli.mjs";
 import { RunStore } from "./store.mjs";
 import { numberFlag, parseArgs, readJson } from "./utils.mjs";
@@ -79,13 +80,14 @@ async function doctor(flags) {
     },
   };
   try {
+    const codexBinary = resolveCodexBinary(config.codex.binary);
     const version = await execFileAsync(
-      config.codex.binary,
+      codexBinary,
       ["--version"],
       DOCTOR_PROCESS_OPTIONS,
     );
     const login = await execFileAsync(
-      config.codex.binary,
+      codexBinary,
       ["login", "status"],
       DOCTOR_PROCESS_OPTIONS,
     );

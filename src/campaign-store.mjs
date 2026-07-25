@@ -368,6 +368,7 @@ export function emptyCatalog() {
     schemaVersion: 1,
     updatedAt: nowIso(),
     entries: {},
+    exclusions: {},
   };
 }
 

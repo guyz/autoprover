@@ -9,6 +9,7 @@ import {
 } from "../utils.mjs";
 import {
   buildSubscriptionChildEnvironment,
+  createSuspensionAwareTimeout,
   registerChildProcessCleanup,
   settleWithin,
 } from "./child-runtime.mjs";
@@ -392,17 +393,18 @@ export function runClaudeProcess({
     };
 
     const clearTimers = () => {
-      if (timer) clearTimeout(timer);
+      timer?.clear?.();
       if (forceKillTimer) clearTimeout(forceKillTimer);
     };
 
     unregisterProcessCleanup = registerChildProcessCleanup(terminate);
     timer = Number.isFinite(timeoutMs)
-      ? setTimeout(() => {
+      ? createSuspensionAwareTimeout(() => {
           timedOut = true;
           terminate();
         }, Math.max(1, timeoutMs))
       : null;
+    timer?.unref?.();
 
     const announceSession = (sessionId) => {
       if (!sessionId || sessionId === announcedSessionId) return;

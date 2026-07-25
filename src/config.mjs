@@ -70,8 +70,17 @@ export function validateConfig(config) {
   ]) {
     integer(key, config[key]);
   }
+  integer(
+    "maxSolverTurnsPerProblem",
+    config.maxSolverTurnsPerProblem ?? 0,
+    true,
+  );
   positive("maxEstimatedUsd", config.maxEstimatedUsd, true);
   positive("roundCooldownSeconds", config.roundCooldownSeconds, true);
+  positive("extensionGateHours", config.extensionGateHours ?? 0, true);
+  if (typeof config.skipSingleBranchSynthesis !== "boolean") {
+    throw new Error("skipSingleBranchSynthesis must be boolean");
+  }
   integer("maxRepairCycles", config.maxRepairCycles, true);
   integer("maxReframesPerBranch", config.maxReframesPerBranch, true);
   if (
@@ -102,6 +111,103 @@ export function validateConfig(config) {
     throw new Error("campaign.stopOnCandidate must be boolean");
   }
   if (
+    !config.campaign.tournament ||
+    typeof config.campaign.tournament !== "object" ||
+    Array.isArray(config.campaign.tournament)
+  ) {
+    throw new Error("campaign.tournament configuration is required");
+  }
+  if (typeof config.campaign.tournament.enabled !== "boolean") {
+    throw new Error("campaign.tournament.enabled must be boolean");
+  }
+  integer(
+    "campaign.tournament.probeProblemCount",
+    config.campaign.tournament.probeProblemCount,
+  );
+  positive(
+    "campaign.tournament.probeHours",
+    config.campaign.tournament.probeHours,
+  );
+  integer(
+    "campaign.tournament.probeSolverTurns",
+    config.campaign.tournament.probeSolverTurns,
+  );
+  integer(
+    "campaign.tournament.minimumPromotableProbes",
+    config.campaign.tournament.minimumPromotableProbes,
+  );
+  integer(
+    "campaign.tournament.semifinalProblemCount",
+    config.campaign.tournament.semifinalProblemCount,
+  );
+  integer(
+    "campaign.tournament.semifinalSolverTurns",
+    config.campaign.tournament.semifinalSolverTurns,
+  );
+  integer(
+    "campaign.tournament.deepProblemCount",
+    config.campaign.tournament.deepProblemCount,
+  );
+  integer(
+    "campaign.tournament.deepSolverTurns",
+    config.campaign.tournament.deepSolverTurns,
+  );
+  for (const key of ["probePromotionScore", "deepPromotionScore"]) {
+    const value = config.campaign.tournament[key];
+    if (!Number.isFinite(value) || value < 0 || value > 100) {
+      throw new Error(
+        `campaign.tournament.${key} must be a number from 0 to 100`,
+      );
+    }
+  }
+  integer(
+    "campaign.tournament.retryAfterRounds",
+    config.campaign.tournament.retryAfterRounds,
+  );
+  integer(
+    "campaign.tournament.maxStageRetries",
+    config.campaign.tournament.maxStageRetries,
+    true,
+  );
+  positive(
+    "campaign.tournament.stageHardHours",
+    config.campaign.tournament.stageHardHours,
+  );
+  if (
+    config.campaign.tournament.minimumPromotableProbes >
+    config.campaign.tournament.probeProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.minimumPromotableProbes cannot exceed probeProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.semifinalProblemCount >
+    config.campaign.tournament.probeProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.semifinalProblemCount cannot exceed probeProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.deepProblemCount >
+    config.campaign.tournament.semifinalProblemCount
+  ) {
+    throw new Error(
+      "campaign.tournament.deepProblemCount cannot exceed semifinalProblemCount",
+    );
+  }
+  if (
+    config.campaign.tournament.semifinalSolverTurns <
+      config.campaign.tournament.probeSolverTurns ||
+    config.campaign.tournament.deepSolverTurns <
+      config.campaign.tournament.semifinalSolverTurns
+  ) {
+    throw new Error(
+      "campaign tournament solver-turn targets must increase from probe to semifinal to deep",
+    );
+  }
+  if (
     !config.discovery ||
     typeof config.discovery !== "object" ||
     Array.isArray(config.discovery)
@@ -112,6 +218,18 @@ export function validateConfig(config) {
   integer("discovery.attackCount", config.discovery.attackCount);
   if (config.discovery.attackCount > config.discovery.poolSize) {
     throw new Error("discovery.attackCount cannot exceed discovery.poolSize");
+  }
+  for (const key of ["vettingReserveFraction", "erdosShare"]) {
+    const value = config.discovery[key];
+    if (!Number.isFinite(value) || value < 0 || value > 1) {
+      throw new Error(`discovery.${key} must be a number from 0 to 1`);
+    }
+  }
+  if (
+    typeof config.discovery.erdosIndexUrl !== "string" ||
+    !/^https:\/\//.test(config.discovery.erdosIndexUrl)
+  ) {
+    throw new Error("discovery.erdosIndexUrl must be an HTTPS URL");
   }
   for (const key of [
     "minimumInterest",
@@ -154,6 +272,13 @@ export function validateConfig(config) {
     throw new Error("codex.binary must be a non-empty string");
   }
   positive("codex.turnTimeoutMinutes", config.codex.turnTimeoutMinutes);
+  if (
+    !["none", "low", "medium", "high", "xhigh", "max", "ultra"].includes(
+      config.codex.effort,
+    )
+  ) {
+    throw new Error("codex.effort is not supported");
+  }
   if (config.codex.subscriptionOnly !== true) {
     throw new Error(
       "codex.subscriptionOnly must be true; use provider=pro for API-billed OpenAI work",

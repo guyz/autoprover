@@ -110,3 +110,18 @@ test("Claude permission modes match the installed CLI vocabulary", async () => {
     /claude.permissionMode is invalid/,
   );
 });
+
+test("the subscription solver accepts Ultra without exposing it to API model roles", async () => {
+  const config = await loadConfig(null, {});
+  assert.equal(config.codex.effort, "ultra");
+  assert.equal(config.models.solver.effort, "max");
+  assert.doesNotThrow(() => validateConfig(config));
+  assert.throws(
+    () =>
+      validateConfig({
+        ...config,
+        codex: { ...config.codex, effort: "impossible" },
+      }),
+    /codex.effort is not supported/,
+  );
+});

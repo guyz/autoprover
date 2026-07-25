@@ -16,6 +16,7 @@ import {
 } from "./campaign-store.mjs";
 import {
   Semaphore,
+  advanceActiveClock,
   clamp,
   nowIso,
   readJson,
@@ -26,6 +27,14 @@ import {
   writeJsonAtomic,
 } from "./utils.mjs";
 import { counterexampleOpportunity } from "./falsification.mjs";
+import {
+  selectProblemPortfolio,
+  strategyCoverageReceipt,
+} from "./diversity.mjs";
+import {
+  loadErdosProblemIndex,
+  selectErdosProblemHints,
+} from "./problem-sources/erdos.mjs";
 
 const HOUR_MS = 60 * 60 * 1_000;
 const CONTINUOUS_CHILD_MAX_CALLS = Number.MAX_SAFE_INTEGER;
@@ -95,6 +104,10 @@ export class CampaignController {
       status: "created",
       startedAt,
       updatedAt: startedAt,
+      selectionSeed: sha256(
+        `${campaignId}:${startedAt}:${shortId()}`,
+      ),
+      selectionEpoch: 0,
       deadlineAt: new Date(
         Date.now() + resolvedPolicy.durationHours * HOUR_MS,
       ).toISOString(),
@@ -111,6 +124,12 @@ export class CampaignController {
         (_, index) => emptySlot(index + 1),
       ),
       attempts: {},
+      tournament: createTournamentState(resolvedPolicy, startedAt),
+      activeClock: {
+        lastHeartbeatAt: startedAt,
+        suspendedMs: 0,
+        lastSuspensionMs: 0,
+      },
       notes: [],
       stopReason: "",
     };
@@ -188,6 +207,7 @@ export class CampaignController {
 
   async run() {
     await this.store.acquireCampaignLock();
+    const stopActiveClock = this.startActiveClock();
     try {
       if (this.resumeOptions) {
         const extendHours = this.resumeOptions.extendHours ?? 0;
@@ -244,7 +264,10 @@ export class CampaignController {
         if (await this.shouldStop()) break;
         await this.processControlCommands();
         await this.reapFinishedWorkers();
-        await this.resumePendingDiscovery();
+        if (!this.policy.tournamentEnabled || this.activeWorkers.size === 0) {
+          await this.resumePendingDiscovery();
+        }
+        await this.advanceTournamentIfReady();
         await this.fillAvailableSlots();
 
         const eligibleCount = await this.eligibleCount();
@@ -319,6 +342,7 @@ export class CampaignController {
       }
       return this.finishFromStop();
     } finally {
+      stopActiveClock();
       await this.store.releaseCampaignLock();
     }
   }
@@ -587,9 +611,13 @@ export class CampaignController {
       const entry = catalog.entries?.[command.problemKey];
       if (!entry) throw new Error("The requested backlog problem no longer exists");
       if (
-        ["candidate-review", "retired", "quarantined"].includes(
-          entry.lifecycle,
-        )
+        [
+          "solved",
+          "human-review",
+          "candidate-review",
+          "retired",
+          "quarantined",
+        ].includes(entry.lifecycle)
       ) {
         throw new Error(
           `“${entry.packet?.title ?? command.problemKey}” is ${entry.lifecycle} and cannot be queued next`,
@@ -878,6 +906,25 @@ export class CampaignController {
   }
 
   discoveryCycleProvider(hints = []) {
+    const erdosHintCount = Math.ceil(
+      Number(this.config.discovery.erdosShare ?? 0) *
+        this.config.discovery.poolSize,
+    );
+    const erdosHintsPromise = erdosHintCount > 0
+      ? loadErdosProblemIndex({
+          url: this.config.discovery.erdosIndexUrl,
+          timeoutMs: 3_000,
+        })
+          .then((entries) =>
+            selectErdosProblemHints(entries, {
+              count: erdosHintCount,
+              seed:
+                `${this.state.selectionSeed}:` +
+                `discovery-cycle-${this.state.cycle}`,
+            }),
+          )
+          .catch(() => [])
+      : Promise.resolve([]);
     return {
       run: async (request) => {
         if (request.schema?.name !== "open_problem_discovery") {
@@ -891,16 +938,78 @@ export class CampaignController {
             title: entry.packet?.title,
             statement: entry.packet?.statement,
           }));
+        const excluded = Object.values(catalog.exclusions ?? {})
+          .slice(-100)
+          .map((entry) => ({
+            problemKey: entry.problemKey,
+            title: entry.title,
+            reason: entry.reason,
+          }));
         const suffix = existing.length
           ? `\n\n<existing_campaign_catalog>\n${JSON.stringify(existing, null, 2)}\n</existing_campaign_catalog>\nDo not return an equivalent statement already in this catalog. Search different sources, domains, or exact variants.`
+          : "";
+        const exclusionSuffix = excluded.length
+          ? `\n\n<locally_excluded_problems>\n${JSON.stringify(excluded, null, 2)}\n</locally_excluded_problems>\nDo not return these problems or cosmetically reworded equivalents. The operator reviewed and removed them from this local research portfolio.`
           : "";
         const operatorRequest = hints.length
           ? `\n\n<operator_requested_problems>\n${JSON.stringify(hints, null, 2)}\n</operator_requested_problems>\nThe operator explicitly requested these problem names or source URLs. Investigate each one first. Include it only if you can recover an exact, currently open statement with reliable sources and it passes the normal tractability and verifiability requirements. Do not invent missing statements or silently substitute a different problem. Use remaining capacity for other strong open problems.`
           : "";
-        return this.gatedProvider.run({
+        const erdosHints = await erdosHintsPromise;
+        const erdosSuffix = erdosHints.length
+          ? `\n\n<live_erdos_problem_candidates>\n${JSON.stringify(erdosHints, null, 2)}\n</live_erdos_problem_candidates>\nThese IDs were sampled from the live teorth/erdosproblems database only from unresolved states. Investigate enough of them to return roughly ${erdosHintCount} strong Erdős packets, but keep only exact variants that independently pass current-status and operational-readiness checks.`
+          : "";
+        const recentEvaluations =
+          (this.state.tournament?.evaluations ?? []).slice(-3);
+        const evaluationSuffix = recentEvaluations.length
+          ? `\n\n<recent_strategy_evaluations>\n${JSON.stringify(recentEvaluations, null, 2)}\n</recent_strategy_evaluations>\nUse these receipts to avoid repeating source types whose prior candidates produced only bounded checks, timeouts, or no decisive route.`
+          : "";
+        const result = await this.gatedProvider.run({
           ...request,
-          prompt: `${request.prompt}${suffix}${operatorRequest}`,
+          prompt:
+            `${request.prompt}${suffix}${exclusionSuffix}${operatorRequest}` +
+            `${erdosSuffix}${evaluationSuffix}`,
         });
+        const existingKeys = new Set(existing.map((entry) => entry.problemKey));
+        const existingTitles = new Set(
+          existing.map((entry) => normalizedCatalogTitle(entry.title)),
+        );
+        const excludedKeys = new Set(
+          excluded.map((entry) => entry.problemKey),
+        );
+        const excludedTitles = new Set(
+          excluded.map((entry) => normalizedCatalogTitle(entry.title)),
+        );
+        const seenKeys = new Set();
+        const seenTitles = new Set();
+        const problems = (result.data?.problems ?? []).filter((problem) => {
+          try {
+            const packet = normalizeProblem(problem);
+            const key = catalogProblemKey(packet);
+            const title = normalizedCatalogTitle(packet.title);
+            if (
+              existingKeys.has(key) ||
+              excludedKeys.has(key) ||
+              existingTitles.has(title) ||
+              excludedTitles.has(title) ||
+              seenKeys.has(key) ||
+              seenTitles.has(title)
+            ) {
+              return false;
+            }
+            seenKeys.add(key);
+            seenTitles.add(title);
+            return true;
+          } catch {
+            return true;
+          }
+        });
+        return {
+          ...result,
+          data: {
+            ...result.data,
+            problems,
+          },
+        };
       },
     };
   }
@@ -913,13 +1022,31 @@ export class CampaignController {
       problems.map((problem) => normalizeProblem(problem)),
     );
     const now = nowIso();
-    const result = { added: 0, seen: normalized.length, problemKeys: [] };
+    const result = {
+      added: 0,
+      excluded: 0,
+      seen: normalized.length,
+      problemKeys: [],
+    };
     await this.store.withCatalogLock(async (catalog) => {
       catalog.entries ??= {};
+      catalog.exclusions ??= {};
+      const excludedTitles = new Set(
+        Object.values(catalog.exclusions)
+          .map((entry) => normalizedCatalogTitle(entry.title))
+          .filter(Boolean),
+      );
       for (const packet of normalized) {
         validateProblemPacket(packet);
         const problemKey = catalogProblemKey(packet);
         result.problemKeys.push(problemKey);
+        if (
+          catalog.exclusions[problemKey] ||
+          excludedTitles.has(normalizedCatalogTitle(packet.title))
+        ) {
+          result.excluded += 1;
+          continue;
+        }
         const existing = catalog.entries[problemKey];
         if (existing) {
           existing.lastSeenAt = now;
@@ -977,40 +1104,162 @@ export class CampaignController {
 
   async fillAvailableSlots() {
     if (!this.canStartWork()) return;
-    let catalog = await this.store.loadCatalog();
-    let ranked = rankCatalogEntries(Object.values(catalog.entries ?? {}));
+    const catalog = await this.store.loadCatalog();
+    const entries = Object.values(catalog.entries ?? {});
+    if (this.policy.tournamentEnabled) {
+      await this.fillPromotedSlots(catalog);
+    }
+    if (
+      this.policy.tournamentEnabled &&
+      this.state.tournament?.stage !== "probing"
+    ) {
+      return;
+    }
+    let ranked = rankCatalogEntries(entries);
+    if (this.policy.tournamentEnabled) {
+      ranked = this.tournamentEligibleEntries(ranked);
+    }
     const preparedAttempts = [];
-    const usedDomains = new Set(
-      this.state.slots
-        .filter((slot) => slot.problemKey)
-        .map((slot) => catalog.entries?.[slot.problemKey]?.packet?.domain)
-        .filter(Boolean),
-    );
-    for (const slot of this.state.slots.filter(
+    const selectedPackets = this.state.slots
+      .filter((slot) => slot.problemKey)
+      .map((slot) => catalog.entries?.[slot.problemKey]?.packet)
+      .filter(Boolean);
+    const idleSlots = this.state.slots.filter(
       (entry) => entry.status === "idle",
-    )) {
+    );
+    const activeProbeCount = Object.values(this.state.attempts ?? {}).filter(
+      (attempt) =>
+        attempt.stage === "probe" &&
+        attempt.tournamentRound === this.state.tournament?.round &&
+        ["starting", "running", "awaiting-manual"].includes(attempt.status),
+    ).length;
+    const remainingProbeCapacity = this.policy.tournamentEnabled
+      ? Math.max(
+          0,
+          this.policy.probeProblemCount -
+            (this.state.tournament?.roundProbedProblemKeys?.length ?? 0) -
+            activeProbeCount,
+        )
+      : idleSlots.length;
+    const selectableSlots = idleSlots.slice(0, remainingProbeCapacity);
+    if (!selectableSlots.length || !ranked.length) return;
+    const portfolio = selectProblemPortfolio(ranked, {
+      count: selectableSlots.length,
+      seed: this.state.selectionSeed,
+      cycle: `${this.state.cycle}:${this.state.selectionEpoch}`,
+      selectedPackets,
+      coverageEntries: entries,
+    });
+    this.state.selectionEpoch += 1;
+    await this.store.event("campaign.portfolio_selected", {
+      selectionEpoch: this.state.selectionEpoch,
+      selected: portfolio.map((entry) => ({
+        problemKey: entry.problemKey,
+        reason: entry.selection?.reason,
+        quality: entry.selection?.quality,
+        coverage: entry.selection?.coverage,
+        similarity: entry.selection?.similarity,
+      })),
+    });
+
+    for (const slot of selectableSlots) {
       if (!this.canStartWork()) break;
-      let candidateIndex = ranked.findIndex(
-        (entry) => !usedDomains.has(entry.packet?.domain),
-      );
-      if (candidateIndex < 0) candidateIndex = 0;
-      const entry = ranked[candidateIndex];
-      if (!entry) break;
-      ranked.splice(candidateIndex, 1);
-      const attempt = await this.startAttempt(slot, entry);
-      if (attempt) {
-        preparedAttempts.push(attempt);
-        if (entry.packet?.domain) usedDomains.add(entry.packet.domain);
+      let attempt = null;
+      while (!attempt && portfolio.length) {
+        const entry = portfolio.shift();
+        attempt = await this.startAttempt(slot, entry, {
+          stage: this.policy.tournamentEnabled ? "probe" : "standard",
+        });
       }
-      catalog = await this.store.loadCatalog();
-      ranked = rankCatalogEntries(Object.values(catalog.entries ?? {}));
+      if (attempt) preparedAttempts.push(attempt);
+    }
+    if (!preparedAttempts.length) {
+      await this.store.saveCampaign(this.state);
     }
     for (const attempt of preparedAttempts) {
       this.launchAttemptWorker(attempt, { resume: false });
     }
   }
 
-  async startAttempt(slot, entry) {
+  async fillPromotedSlots(catalog) {
+    const stage = this.state.tournament?.stage;
+    if (!["probing", "semifinal", "deep"].includes(stage)) return;
+    const idleSlots = this.state.slots.filter(
+      (entry) => entry.status === "idle",
+    );
+    if (!idleSlots.length) return;
+    const promoted = new Set(
+      this.state.tournament?.promotedProblemKeys ?? [],
+    );
+    const resumable = Object.values(this.state.attempts ?? {})
+      .filter(
+        (attempt) =>
+          attempt.tournamentRound === this.state.tournament?.round &&
+          (
+            stage === "probing"
+              ? attempt.stage === "probe"
+              : promoted.has(attempt.problemKey) && attempt.stage === stage
+          ) &&
+          !attempt.projectedAt &&
+          ["promoted", "paused", "retryable"].includes(attempt.status) &&
+          !this.slotForAttempt(attempt.attemptId),
+      )
+      .sort(
+        (left, right) =>
+          Number(right.probeScore ?? 0) - Number(left.probeScore ?? 0),
+      );
+    for (const slot of idleSlots) {
+      if (!this.canStartWork()) break;
+      let attempt = null;
+      while (!attempt && resumable.length) {
+        const candidate = resumable.shift();
+        const entry = catalog.entries?.[candidate.problemKey];
+        if (!entry) continue;
+        attempt = await this.resumePromotedAttempt(slot, candidate, entry);
+      }
+      if (attempt) this.launchAttemptWorker(attempt, { resume: true });
+    }
+  }
+
+  async resumePromotedAttempt(slot, attempt, entry) {
+    const lease = await this.store.acquireLease(entry.problemKey, {
+      ownerId: `${this.state.campaignId}:${slot.slotId}`,
+      slotId: slot.slotId,
+      attemptId: attempt.attemptId,
+      runDir: attempt.runDir,
+      ttlMs: this.policy.leaseTtlMs,
+    });
+    if (!lease) return null;
+    const wasRetryable = attempt.status === "retryable";
+    attempt.lease = lease;
+    attempt.slotId = slot.slotId;
+    attempt.status = wasRetryable ? "retrying" : "promoted";
+    attempt.pauseReason =
+      wasRetryable
+        ? `Retrying the interrupted ${attempt.stage} stage from its saved thread`
+        : `Promoted into ${attempt.stage}; resume the exact saved research thread`;
+    Object.assign(slot, {
+      status: "starting",
+      problemKey: entry.problemKey,
+      attemptId: attempt.attemptId,
+      runDir: attempt.runDir,
+      startedAt: attempt.startedAt,
+      latestNote:
+        `${tournamentStageLabel(attempt.stage)}: ${entry.packet.title}`,
+    });
+    await this.store.event("campaign.problem_promoted_started", {
+      problemKey: entry.problemKey,
+      attemptId: attempt.attemptId,
+      slotId: slot.slotId,
+      tournamentRound: attempt.tournamentRound,
+      probeScore: attempt.probeScore,
+      stage: attempt.stage,
+    });
+    await this.store.saveCampaign(this.state);
+    return attempt;
+  }
+
+  async startAttempt(slot, entry, { stage = "standard" } = {}) {
     const attemptId = `attempt-${String(
       Object.keys(this.state.attempts).length + 1,
     ).padStart(4, "0")}-${entry.problemKey.slice(0, 10)}-${shortId()}`;
@@ -1045,6 +1294,18 @@ export class CampaignController {
       projectedAt: null,
       outcome: null,
       note: "",
+      stage,
+      tournamentRound:
+        stage === "probe" ? this.state.tournament?.round ?? 1 : null,
+      probeCompletedAt: null,
+      probeScore: null,
+      probeScoreBreakdown: null,
+      stageScores: {},
+      stageRetries: {},
+      solverTurnTargets: {},
+      stageStartSolverTurns: {
+        [stage]: 0,
+      },
     };
     this.state.attempts[attemptId] = attempt;
     Object.assign(slot, {
@@ -1057,7 +1318,9 @@ export class CampaignController {
     });
     await this.addNote(
       "progress",
-      `Slot ${slot.slotId} selected “${entry.packet.title}” (${entry.ranking?.rationale ?? "highest current priority"}).`,
+      `Slot ${slot.slotId} selected “${entry.packet.title}” for ${
+        stage === "probe" ? "a short probe" : "research"
+      } (${entry.ranking?.rationale ?? "automatic quality-diversity selection"}).`,
       { problemKey: entry.problemKey, attemptId },
     );
     await this.store.event("campaign.problem_leased", {
@@ -1073,12 +1336,27 @@ export class CampaignController {
 
   launchAttemptWorker(attempt, { resume }) {
     if (this.activeWorkers.has(attempt.attemptId)) return;
+    const resumeFromCampaignBoundary =
+      Boolean(resume) &&
+      (
+        Boolean(attempt.pauseReason) ||
+        (
+          attempt.stage === "deep" &&
+          Boolean(attempt.probeCompletedAt)
+        ) ||
+        ["paused", "deadline-reached", "budget-exhausted"].includes(
+          attempt.status,
+        )
+      );
     const slot = this.slotForAttempt(attempt.attemptId);
     if (slot) slot.status = "running";
     attempt.status = "running";
     attempt.pausedAt = null;
     attempt.pauseReason = "";
-    const promise = this.executeAttempt(attempt, { resume })
+    const promise = this.executeAttempt(attempt, {
+      resume,
+      resumeFromCampaignBoundary,
+    })
       .catch(async (error) => {
         attempt.status = "failed";
         attempt.completedAt = nowIso();
@@ -1106,7 +1384,10 @@ export class CampaignController {
     this.activeWorkers.set(attempt.attemptId, promise);
   }
 
-  async executeAttempt(attempt, { resume }) {
+  async executeAttempt(
+    attempt,
+    { resume, resumeFromCampaignBoundary = false },
+  ) {
     const catalog = await this.store.loadCatalog();
     const entry = catalog.entries?.[attempt.problemKey];
     if (!entry || !leaseTokenMatches(entry, attempt.lease)) {
@@ -1121,12 +1402,16 @@ export class CampaignController {
     }, this.policy.leaseHeartbeatMs);
     heartbeat.unref?.();
     try {
+      const attemptWindowHours = this.attemptWindowHours(attempt);
       const childConfig = this.childConfig({
-        wallClockHours: Math.min(
-          this.policy.problemHours,
-          this.remainingHours(),
-        ),
+        wallClockHours: attemptWindowHours,
       });
+      if (this.policy.tournamentEnabled) {
+        const solverTurnTarget = this.stageSolverTurnTarget(attempt.stage);
+        childConfig.maxSolverTurnsPerProblem = solverTurnTarget;
+        attempt.solverTurnTargets ??= {};
+        attempt.solverTurnTargets[attempt.stage] = solverTurnTarget;
+      }
       let app;
       const attemptProvider = {
         run: async (request) => {
@@ -1141,25 +1426,20 @@ export class CampaignController {
       };
       if (resume && (await fileExists(path.join(attempt.runDir, "run.json")))) {
         const previousChildState = await readChildState(attempt.runDir);
-        const childDeadlineExpired =
-          previousChildState?.status === "deadline-reached" ||
-          (
-            previousChildState?.deadlineAt &&
-            Date.now() >= Date.parse(previousChildState.deadlineAt)
-          );
-        const childExtendHours = childDeadlineExpired
-          ? Math.min(
-              this.policy.problemHours,
-              this.remainingHours(),
-            )
-          : 0;
+        const childExtendHours = childResumeExtensionHours({
+          childState: previousChildState,
+          resumeFromCampaignBoundary,
+          windowHours: attemptWindowHours,
+        });
         app = await Autoprover.resume({
           config: childConfig,
           provider: attemptProvider,
           providerName: this.providerName,
           runDir: attempt.runDir,
           extendHours: childExtendHours,
-          reopenInterrupted: Boolean(attempt.pauseReason),
+          reopenInterrupted:
+            resumeFromCampaignBoundary ||
+            ["retrying", "retryable"].includes(attempt.status),
         });
       } else {
         app = await Autoprover.create({
@@ -1195,6 +1475,34 @@ export class CampaignController {
     }
   }
 
+  attemptWindowHours(attempt) {
+    if (
+      this.policy.tournamentEnabled &&
+      ["probe", "semifinal", "deep"].includes(attempt.stage)
+    ) {
+      const minimumCallWindowHours =
+        Math.max(
+          Number(this.config.codex?.turnTimeoutMinutes ?? 120),
+          Number(this.config.claude?.turnTimeoutMinutes ?? 120),
+          Number(this.config.responses?.requestTimeoutMinutes ?? 120),
+        ) /
+          60 +
+        0.25;
+      return Math.min(
+        this.policy.stageHardHours,
+        Math.max(this.remainingHours(), minimumCallWindowHours),
+      );
+    }
+    return Math.min(this.policy.problemHours, this.remainingHours());
+  }
+
+  stageSolverTurnTarget(stage) {
+    if (stage === "probe") return this.policy.probeSolverTurns;
+    if (stage === "semifinal") return this.policy.semifinalSolverTurns;
+    if (stage === "deep") return this.policy.deepSolverTurns;
+    return Number(this.config.maxSolverTurnsPerProblem ?? 0);
+  }
+
   async projectFinishedAttempt(attempt, childState) {
     if (attempt.projectedAt) {
       await this.releaseAttemptSlot(attempt);
@@ -1206,6 +1514,11 @@ export class CampaignController {
     // projected normally and its slot can keep moving.
     await this.ensureContinuousCallBudget();
     const summary = summarizeChildAttempt(attempt, childState);
+    summary.stageSolverTurns = Math.max(
+      0,
+      summary.solverTurns -
+        Number(attempt.stageStartSolverTurns?.[attempt.stage] ?? 0),
+    );
     const stopRequest = await this.store.readStopRequest();
     const callOrCostBudgetExhausted = !this.globalBudgetAvailable();
     const interrupted =
@@ -1256,6 +1569,26 @@ export class CampaignController {
       await this.store.saveCampaign(this.state);
       return;
     }
+    const tournamentStage =
+      attempt.stage === "probe" ? "probing" : attempt.stage;
+    if (
+      this.policy.tournamentEnabled &&
+      ["probing", "semifinal", "deep"].includes(tournamentStage) &&
+      this.state.tournament?.stage === tournamentStage &&
+      !summary.hasCandidate &&
+      !interrupted
+    ) {
+      if (summary.stageSolverTurns > 0 && summary.outcome !== "failed") {
+        await this.checkpointProbeAttempt(attempt, childState, summary);
+      } else {
+        await this.markTournamentAttemptRetryable(
+          attempt,
+          childState,
+          summary,
+        );
+      }
+      return;
+    }
     if (attempt.switchRequestedAt && !summary.hasCandidate) {
       summary.outcome = "interrupted";
       summary.note = `${summary.note} Switched out at an operator-requested checkpoint.`;
@@ -1274,7 +1607,8 @@ export class CampaignController {
       entry.latestNote = summary.note;
       entry.lastAttemptAt = summary.completedAt;
       if (summary.hasCandidate) {
-        entry.lifecycle = "candidate-review";
+        entry.lifecycle =
+          summary.outcome === "solved" ? "solved" : "human-review";
         entry.cooldownUntil = null;
         if (this.policy.stopOnCandidate) {
           this.state.stopRequestedByCandidate = true;
@@ -1327,7 +1661,11 @@ export class CampaignController {
     attempt.outcome = summary.outcome;
     attempt.note = summary.note;
     await this.addNote(
-      summary.hasCandidate ? "candidate" : "result",
+      summary.outcome === "solved"
+        ? "solved"
+        : summary.hasCandidate
+          ? "candidate"
+          : "result",
       summary.note,
       { problemKey: attempt.problemKey, attemptId: attempt.attemptId },
     );
@@ -1353,6 +1691,145 @@ export class CampaignController {
     }
     await this.releaseAttemptSlot(attempt);
     await this.store.saveCampaign(this.state);
+  }
+
+  async checkpointProbeAttempt(attempt, childState, summary) {
+    const score = scoreProbeAttempt({
+      summary,
+      childState,
+    });
+    const stage = attempt.stage ?? "probe";
+    const stageLabel = tournamentStageLabel(stage);
+    let accepted = false;
+    await this.store.withCatalogLock(async (catalog) => {
+      const entry = catalog.entries?.[attempt.problemKey];
+      if (!entry || !leaseTokenMatches(entry, attempt.lease)) return;
+      entry.probes ??= [];
+      if (
+        !entry.probes.some(
+          (record) =>
+            record.attemptId === attempt.attemptId &&
+            (record.stage ?? "probe") === stage,
+        )
+      ) {
+        entry.probes.push({
+          attemptId: attempt.attemptId,
+          runDir: attempt.runDir,
+          tournamentRound: attempt.tournamentRound,
+          stage,
+          completedAt: summary.completedAt,
+          activeWorkMs: summary.activeWorkMs,
+          callsStarted: summary.callsStarted,
+          rounds: summary.rounds,
+          solverTurns: summary.stageSolverTurns,
+          cumulativeSolverTurns: summary.solverTurns,
+          evidenceCount: summary.evidenceCount,
+          score: score.score,
+          scoreBreakdown: score.breakdown,
+          promotable: score.promotable,
+          decisiveProgress: score.decisiveProgress,
+          strategyCoverage: summary.strategyCoverage ?? [],
+          note: summary.note,
+        });
+      }
+      entry.lifecycle = "eligible";
+      entry.cooldownUntil = null;
+      entry.latestNote =
+        `${stageLabel} complete (decisive score ${score.score.toFixed(1)}); ` +
+        "awaiting automatic comparison.";
+      entry.ranking = scoreCatalogEntry(entry);
+      accepted = true;
+    });
+    if (!accepted) {
+      await this.releaseAttemptSlot(attempt, { releaseLease: false });
+      return;
+    }
+    attempt.status = "stage-complete";
+    attempt.probeCompletedAt ??= summary.completedAt;
+    attempt.probeScore = score.score;
+    attempt.probeScoreBreakdown = score.breakdown;
+    attempt.stageScores ??= {};
+    attempt.stageScores[stage] = {
+      score: score.score,
+      breakdown: score.breakdown,
+      promotable: score.promotable,
+      decisiveProgress: score.decisiveProgress,
+      completedAt: summary.completedAt,
+      solverTurns: summary.stageSolverTurns,
+      cumulativeSolverTurns: summary.solverTurns,
+    };
+    attempt.checkpoint = summary;
+    attempt.note = summary.note;
+    const completionField = tournamentCompletionField(stage);
+    this.state.tournament[completionField] = [
+      ...new Set([
+        ...(this.state.tournament[completionField] ?? []),
+        attempt.problemKey,
+      ]),
+    ];
+    if (stage === "probe") {
+      this.state.tournament.allProbedProblemKeys = [
+        ...new Set([
+          ...(this.state.tournament.allProbedProblemKeys ?? []),
+          attempt.problemKey,
+        ]),
+      ];
+      this.state.tournament.lastProbedRoundByProblem[attempt.problemKey] =
+        attempt.tournamentRound;
+    }
+    await this.store.event("campaign.tournament_stage_completed", {
+      attemptId: attempt.attemptId,
+      problemKey: attempt.problemKey,
+      tournamentRound: attempt.tournamentRound,
+      stage,
+      probeScore: score.score,
+      scoreBreakdown: score.breakdown,
+      promotable: score.promotable,
+      decisiveProgress: score.decisiveProgress,
+    });
+    await this.addNote(
+      "progress",
+      `${stageLabel} saved for “${childState.problems?.[0]?.packet?.title ?? attempt.problemKey}”. Its decisive score is ${score.score.toFixed(1)}; ${score.promotable ? "it remains eligible for more compute" : "bounded or non-decisive work will not be promoted"}.`,
+      { problemKey: attempt.problemKey, attemptId: attempt.attemptId },
+    );
+    await this.releaseAttemptSlot(attempt);
+    await this.store.saveCampaign(this.state);
+  }
+
+  async markTournamentAttemptRetryable(attempt, childState, summary) {
+    const stage = attempt.stage ?? "probe";
+    attempt.stageRetries ??= {};
+    const retries = (attempt.stageRetries[stage] ?? 0) + 1;
+    attempt.stageRetries[stage] = retries;
+    if (retries <= this.policy.maxStageRetries) {
+      attempt.status = "retryable";
+      attempt.pauseReason =
+        `${tournamentStageLabel(stage)} did not complete a solver turn; ` +
+        `retry ${retries}/${this.policy.maxStageRetries} will resume the saved thread`;
+      attempt.note = summary.note;
+      await this.store.withCatalogLock(async (catalog) => {
+        const entry = catalog.entries?.[attempt.problemKey];
+        if (!entry || !leaseTokenMatches(entry, attempt.lease)) return;
+        entry.lifecycle = "eligible";
+        entry.cooldownUntil = null;
+        entry.latestNote = attempt.pauseReason;
+      });
+      await this.store.event("campaign.tournament_stage_retryable", {
+        attemptId: attempt.attemptId,
+        problemKey: attempt.problemKey,
+        tournamentRound: attempt.tournamentRound,
+        stage,
+        retries,
+        childStatus: childState.status,
+      });
+      await this.releaseAttemptSlot(attempt);
+      await this.store.saveCampaign(this.state);
+      return;
+    }
+    summary.note =
+      `${summary.note} ${tournamentStageLabel(stage)} exhausted ` +
+      `${this.policy.maxStageRetries} retries without a completed solver turn.`;
+    await this.checkpointProbeAttempt(attempt, childState, summary);
   }
 
   async releaseAttemptSlot(attempt, { releaseLease = true } = {}) {
@@ -1465,9 +1942,341 @@ export class CampaignController {
 
   async eligibleCount() {
     const catalog = await this.store.loadCatalog();
-    return Object.values(catalog.entries ?? {}).filter((entry) =>
-      isCampaignCandidateEligible(entry),
+    return this.tournamentEligibleEntries(
+      Object.values(catalog.entries ?? {}),
     ).length;
+  }
+
+  tournamentEligibleEntries(entries) {
+    const eligible = (entries ?? []).filter((entry) =>
+      isCampaignCandidateEligible(entry),
+    );
+    if (!this.policy.tournamentEnabled) return eligible;
+    const tournament = this.state.tournament;
+    if (["semifinal", "deep"].includes(tournament?.stage)) {
+      const promoted = new Set(tournament.promotedProblemKeys ?? []);
+      return eligible.filter((entry) => promoted.has(entry.problemKey));
+    }
+    return eligible.filter(
+      (entry) => {
+        if (entry.operatorPriority) return true;
+        const lastRound = Number(
+          tournament?.lastProbedRoundByProblem?.[entry.problemKey] ?? 0,
+        );
+        return (
+          !lastRound ||
+          Number(tournament?.round ?? 1) - lastRound >=
+            this.policy.retryAfterRounds
+        );
+      },
+    );
+  }
+
+  async advanceTournamentIfReady() {
+    if (!this.policy.tournamentEnabled) return false;
+    const tournament = this.state.tournament;
+    if (!tournament) return false;
+    if (!["probing", "semifinal", "deep"].includes(tournament.stage)) {
+      return false;
+    }
+    if (this.activeWorkers.size > 0) return false;
+    const stage = tournament.stage === "probing" ? "probe" : tournament.stage;
+    const attempts = this.tournamentStageAttempts(stage).filter(
+      (attempt) => attempt.status === "stage-complete",
+    );
+    if (!attempts.length) return false;
+
+    if (stage === "probe") {
+      const catalog = await this.store.loadCatalog();
+      const unprobed = this.tournamentEligibleEntries(
+        Object.values(catalog.entries ?? {}),
+      );
+      const enough = attempts.length >= this.policy.probeProblemCount;
+      const timePressure = this.remainingHours() <= 2.5;
+      const discoveryExhausted =
+        unprobed.length === 0 &&
+        (
+          !this.canRefreshCatalog() ||
+          this.state.emptyDiscoveryCycles >=
+            this.policy.maxEmptyDiscoveryCycles
+        );
+      const minimumRequired =
+        timePressure || discoveryExhausted
+          ? 1
+          : this.policy.minimumPromotableProbes;
+      if (
+        attempts.length < minimumRequired ||
+        (!enough && !timePressure && !discoveryExhausted)
+      ) {
+        return false;
+      }
+      await this.recordTournamentEvaluation(stage, attempts);
+      const promoted = await this.promoteTournamentStage(attempts, {
+        fromStage: "probe",
+        toStage: "semifinal",
+        count: this.policy.semifinalProblemCount,
+        minimumScore: this.policy.probePromotionScore,
+      });
+      if (!promoted.length) {
+        await this.startNextTournamentRound(
+          "The probe strategy produced no decisive lead, so no arbitrary finalist received more compute.",
+        );
+      }
+      return true;
+    }
+
+    const expectedKeys = new Set(tournament.promotedProblemKeys ?? []);
+    if (
+      attempts.length < expectedKeys.size ||
+      attempts.some((attempt) => !expectedKeys.has(attempt.problemKey))
+    ) {
+      return false;
+    }
+    await this.recordTournamentEvaluation(stage, attempts);
+
+    if (stage === "semifinal") {
+      const promoted = await this.promoteTournamentStage(attempts, {
+        fromStage: "semifinal",
+        toStage: "deep",
+        count: this.policy.deepProblemCount,
+        minimumScore: this.policy.deepPromotionScore,
+      });
+      if (!promoted.length) {
+        await this.startNextTournamentRound(
+          "The semifinal follow-ups did not turn any probe into a decisive route.",
+        );
+      }
+      return true;
+    }
+
+    await this.finalizeTournamentAttempts(attempts, {
+      stage: "deep",
+      promotedIds: new Set(),
+      terminal: true,
+    });
+    await this.startNextTournamentRound(
+      "Deep finalists completed four solver turns without an accepted proof or counterexample.",
+    );
+    return true;
+  }
+
+  tournamentStageAttempts(stage) {
+    return Object.values(this.state.attempts ?? {}).filter(
+      (attempt) =>
+        attempt.stage === stage &&
+        attempt.tournamentRound === this.state.tournament?.round &&
+        !attempt.projectedAt,
+    );
+  }
+
+  async promoteTournamentStage(
+    attempts,
+    { fromStage, toStage, count, minimumScore },
+  ) {
+    const promotedAttempts = [...attempts]
+      .filter((attempt) => {
+        const score = attempt.stageScores?.[fromStage];
+        return score?.promotable && Number(score.score ?? 0) >= minimumScore;
+      })
+      .sort(
+        (left, right) =>
+          Number(right.stageScores?.[fromStage]?.score ?? 0) -
+            Number(left.stageScores?.[fromStage]?.score ?? 0) ||
+          left.problemKey.localeCompare(right.problemKey),
+      )
+      .slice(0, count);
+    const promotedIds = new Set(
+      promotedAttempts.map((attempt) => attempt.attemptId),
+    );
+    await this.finalizeTournamentAttempts(attempts, {
+      stage: fromStage,
+      promotedIds,
+      terminal: false,
+    });
+    const promotedAt = nowIso();
+    for (const attempt of promotedAttempts) {
+      attempt.stageStartSolverTurns ??= {};
+      attempt.stageStartSolverTurns[toStage] =
+        attempt.checkpoint?.solverTurns ?? 0;
+      attempt.stage = toStage;
+      attempt.status = "promoted";
+      attempt.projectedAt = null;
+      attempt.completedAt = null;
+      attempt.outcome = null;
+      attempt.pauseReason =
+        `Promoted from ${tournamentStageLabel(fromStage)} to ` +
+        `${tournamentStageLabel(toStage)} using decisive progress, not raw activity`;
+    }
+    this.state.tournament.stage = toStage;
+    this.state.tournament.promotedAt = promotedAt;
+    this.state.tournament.promotedProblemKeys = promotedAttempts.map(
+      (attempt) => attempt.problemKey,
+    );
+    this.state.tournament[tournamentCompletionField(toStage)] = [];
+    this.state.tournament.stageStartedAt = promotedAt;
+    this.state.tournament.stageStartedCalls =
+      this.state.budget.callsStarted;
+    await this.store.withCatalogLock(async (catalog) => {
+      for (const attempt of promotedAttempts) {
+        const entry = catalog.entries?.[attempt.problemKey];
+        if (!entry) continue;
+        entry.lifecycle = "eligible";
+        entry.cooldownUntil = null;
+        entry.latestNote =
+          `Promoted to ${tournamentStageLabel(toStage)} with decisive score ` +
+          `${Number(attempt.stageScores?.[fromStage]?.score ?? 0).toFixed(1)}.`;
+        entry.ranking = scoreCatalogEntry(entry);
+      }
+    });
+    await this.store.event("campaign.tournament_promoted", {
+      tournamentRound: this.state.tournament.round,
+      fromStage,
+      toStage,
+      minimumScore,
+      promoted: promotedAttempts.map((attempt) => ({
+        attemptId: attempt.attemptId,
+        problemKey: attempt.problemKey,
+        score: attempt.stageScores?.[fromStage]?.score ?? 0,
+        decisiveProgress:
+          attempt.stageScores?.[fromStage]?.decisiveProgress ?? "none",
+      })),
+    });
+    await this.addNote(
+      promotedAttempts.length ? "progress" : "info",
+      promotedAttempts.length
+        ? `${tournamentStageLabel(fromStage)} promoted ${promotedAttempts.length} problem${promotedAttempts.length === 1 ? "" : "s"} to ${tournamentStageLabel(toStage)}.`
+        : `${tournamentStageLabel(fromStage)} produced no lead above the decisive threshold.`,
+    );
+    await this.store.saveCampaign(this.state);
+    return promotedAttempts;
+  }
+
+  async finalizeTournamentAttempts(
+    attempts,
+    { stage, promotedIds, terminal },
+  ) {
+    const completedAt = nowIso();
+    await this.store.withCatalogLock(async (catalog) => {
+      for (const attempt of attempts) {
+        if (promotedIds.has(attempt.attemptId)) continue;
+        const entry = catalog.entries?.[attempt.problemKey];
+        attempt.status = terminal ? "completed" : "not-promoted";
+        attempt.completedAt =
+          attempt.checkpoint?.completedAt ?? completedAt;
+        attempt.projectedAt = completedAt;
+        attempt.outcome = terminal ? "not-solved" : `${stage}-deferred`;
+        if (!entry) continue;
+        if (terminal && attempt.checkpoint) {
+          entry.attempts ??= [];
+          if (
+            !entry.attempts.some(
+              (record) => record.attemptId === attempt.attemptId,
+            )
+          ) {
+            entry.attempts.push({
+              ...attempt.checkpoint,
+              outcome: "not-solved",
+            });
+          }
+          entry.lastAttemptAt = completedAt;
+        }
+        entry.lifecycle = "eligible";
+        entry.cooldownUntil = null;
+        entry.latestNote = terminal
+          ? "No proof or counterexample after the configured deep solver turns; saved for a later reframed retry."
+          : `${tournamentStageLabel(stage)} saved but not promoted because its work was less decisive than the alternatives.`;
+        entry.ranking = scoreCatalogEntry(entry);
+      }
+    });
+  }
+
+  async recordTournamentEvaluation(stage, attempts) {
+    const scores = attempts.map(
+      (attempt) => attempt.stageScores?.[stage]?.score ?? 0,
+    );
+    const solverTurns = attempts.reduce(
+      (sum, attempt) =>
+        sum + Number(attempt.stageScores?.[stage]?.solverTurns ?? 0),
+      0,
+    );
+    const decisiveLeads = attempts.filter((attempt) =>
+      ["reusable-lemma", "exact-reduction", "complete-candidate"].includes(
+        attempt.stageScores?.[stage]?.decisiveProgress,
+      ),
+    ).length;
+    const zeroTurnAttempts = attempts.filter(
+      (attempt) =>
+        Number(attempt.stageScores?.[stage]?.solverTurns ?? 0) === 0,
+    ).length;
+    const evaluation = {
+      at: nowIso(),
+      round: this.state.tournament.round,
+      stage,
+      problemsCompared: attempts.length,
+      solverTurns,
+      zeroTurnAttempts,
+      decisiveLeads,
+      meanDecisiveScore: Number(
+        (
+          scores.reduce((sum, value) => sum + Number(value), 0) /
+          Math.max(1, scores.length)
+        ).toFixed(2),
+      ),
+      bestDecisiveScore: Number(Math.max(0, ...scores).toFixed(2)),
+      callsUsed:
+        this.state.budget.callsStarted -
+        Number(this.state.tournament.stageStartedCalls ?? 0),
+      verdict:
+        zeroTurnAttempts > attempts.length / 3
+          ? "mechanically-unhealthy"
+          : decisiveLeads > 0
+            ? "promising"
+            : "weak",
+    };
+    this.state.tournament.evaluations ??= [];
+    this.state.tournament.evaluations.push(evaluation);
+    await this.store.event("campaign.strategy_evaluated", evaluation);
+    await this.addNote(
+      evaluation.verdict === "promising" ? "progress" : "info",
+      `Strategy check: ${tournamentStageLabel(stage)} compared ${attempts.length} problems across ${solverTurns} completed solver turns; ${decisiveLeads} decisive lead${decisiveLeads === 1 ? "" : "s"}. Verdict: ${evaluation.verdict}.`,
+    );
+    return evaluation;
+  }
+
+  async startNextTournamentRound(reason) {
+    if (this.remainingHours() <= 0.25) return false;
+    const tournament = this.state.tournament;
+    tournament.rounds ??= [];
+    tournament.rounds.push({
+      round: tournament.round,
+      startedAt: tournament.roundStartedAt,
+      completedAt: nowIso(),
+      reason,
+      probedProblemKeys: [...tournament.roundProbedProblemKeys],
+      semifinalProblemKeys: [...tournament.roundSemifinalProblemKeys],
+      deepProblemKeys: [...tournament.roundDeepProblemKeys],
+    });
+    tournament.round += 1;
+    tournament.stage = "probing";
+    tournament.roundStartedAt = nowIso();
+    tournament.stageStartedAt = tournament.roundStartedAt;
+    tournament.stageStartedCalls = this.state.budget.callsStarted;
+    tournament.roundProbedProblemKeys = [];
+    tournament.roundSemifinalProblemKeys = [];
+    tournament.roundDeepProblemKeys = [];
+    tournament.promotedProblemKeys = [];
+    tournament.promotedAt = null;
+    this.state.nextDiscoveryAt = nowIso();
+    await this.store.event("campaign.tournament_round_started", {
+      tournamentRound: tournament.round,
+      reason,
+    });
+    await this.addNote(
+      "info",
+      `${reason} Round ${tournament.round} will discover and test different problems; saved work remains eligible after its automatic retry gap.`,
+    );
+    await this.store.saveCampaign(this.state);
+    return true;
   }
 
   canStartWork() {
@@ -1540,7 +2349,43 @@ export class CampaignController {
   }
 
   deadlineReached() {
+    this.tickActiveClock();
     return Date.now() >= Date.parse(this.state.deadlineAt);
+  }
+
+  startActiveClock() {
+    this.activeClockUsers ??= 0;
+    this.activeClockUsers += 1;
+    if (!this.activeClockTimer) {
+      this.tickActiveClock();
+      this.activeClockTimer = setInterval(
+        () => this.tickActiveClock(),
+        1_000,
+      );
+      this.activeClockTimer.unref?.();
+    }
+    return () => {
+      this.activeClockUsers = Math.max(0, (this.activeClockUsers ?? 1) - 1);
+      if (this.activeClockUsers || !this.activeClockTimer) return;
+      clearInterval(this.activeClockTimer);
+      this.activeClockTimer = null;
+    };
+  }
+
+  tickActiveClock() {
+    const advanced = advanceActiveClock(
+      this.state.activeClock,
+      this.state.deadlineAt,
+    );
+    this.state.activeClock = advanced.clock;
+    this.state.deadlineAt = advanced.deadlineAt;
+    if (advanced.suspendedMs > 0) {
+      this.state.lastSuspension = {
+        at: nowIso(),
+        durationMs: advanced.suspendedMs,
+      };
+    }
+    return advanced.suspendedMs;
   }
 
   remainingHours() {
@@ -1551,6 +2396,15 @@ export class CampaignController {
   }
 
   discoveryDue() {
+    if (this.policy.tournamentEnabled) {
+      if (["semifinal", "deep"].includes(this.state.tournament?.stage)) {
+        return false;
+      }
+      if (this.activeWorkers.size > 0) return false;
+      const probed =
+        this.state.tournament?.roundProbedProblemKeys?.length ?? 0;
+      if (probed < this.policy.probeProblemCount) return true;
+    }
     const attemptsSinceRefresh =
       this.completedAttemptCount() -
       (this.state.attemptsAtLastDiscovery ?? 0);
@@ -1562,8 +2416,17 @@ export class CampaignController {
 
   canRefreshCatalog() {
     return (
-      this.policy.maxCycles === 0 ||
-      this.state.cycle < this.policy.maxCycles
+      (
+        !this.policy.tournamentEnabled ||
+        (
+          this.state.tournament?.stage === "probing" &&
+          this.activeWorkers.size === 0
+        )
+      ) &&
+      (
+        this.policy.maxCycles === 0 ||
+        this.state.cycle < this.policy.maxCycles
+      )
     );
   }
 
@@ -1638,7 +2501,10 @@ export class CampaignController {
     ) {
       const catalog = await this.store.loadCatalog();
       const hasCandidate = Object.values(catalog.entries ?? {}).some(
-        (entry) => entry.lifecycle === "candidate-review",
+        (entry) =>
+          ["solved", "human-review", "candidate-review"].includes(
+            entry.lifecycle,
+          ),
       );
       this.state.status = hasCandidate ? "completed-with-candidate" : "completed";
     }
@@ -1779,14 +2645,26 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         completedAt: attempt.completedAt,
         activeWorkMs: attempt.activeWorkMs ?? 0,
         callsStarted: attempt.callsStarted ?? 0,
+        solverTurns: attempt.solverTurns ?? 0,
         rounds: attempt.rounds ?? 0,
         evidenceCount: attempt.evidenceCount ?? 0,
         candidateKind: attempt.candidateKind ?? null,
         note: attempt.note ?? "",
       }));
       const slot = slotByKey.get(entry.problemKey);
+      const tournamentAttempt = Object.values(campaign.attempts ?? {})
+        .filter((attempt) => attempt.problemKey === entry.problemKey)
+        .sort((left, right) =>
+          String(right.probeCompletedAt ?? right.completedAt ?? "").localeCompare(
+            String(left.probeCompletedAt ?? left.completedAt ?? ""),
+          ),
+        )[0];
       const state = slot
         ? slot.status
+        : ["probed", "stage-complete", "not-promoted"].includes(
+              tournamentAttempt?.status,
+            )
+          ? "saved"
         : isCampaignCandidateEligible(entry)
           ? "queued"
           : entry.lifecycle ?? "deferred";
@@ -1809,6 +2687,12 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         ),
         counterexampleVerificationPlan:
           entry.packet.counterexampleVerificationPlan ?? "",
+        artifactReadiness: entry.packet.artifactReadiness ?? null,
+        minimumDecisiveArtifact:
+          entry.packet.minimumDecisiveArtifact ?? "",
+        blockingDependencies:
+          entry.packet.blockingDependencies ?? [],
+        probeScore: tournamentAttempt?.probeScore ?? null,
         selectionReason: entry.operatorPriority
           ? "Pinned by the operator to run next"
           : ranking.rationale,
@@ -1913,6 +2797,12 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
               ? "checking a partial result"
               : activeVerificationRuns.length
                 ? "checking an unclassified research claim"
+            : attempt?.stage === "probe"
+              ? "probing solution potential"
+              : attempt?.stage === "semifinal"
+                ? "testing a promising lead"
+              : attempt?.stage === "deep"
+                ? "deep solving"
             : (problem?.branches?.length ?? 0) > 0
               ? "researching approaches"
               : "planning approaches",
@@ -2014,6 +2904,14 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         Number(left.status?.startsWith("candidate-complete")) ||
       String(right.completedAt).localeCompare(String(left.completedAt)),
   );
+  const discoveryActivity = {
+    active: false,
+    cycle: null,
+    callsRunning: 0,
+    callsCompleted: 0,
+    callsFailed: 0,
+    phase: null,
+  };
   for (const record of Object.values(campaign.discoveryRuns ?? {})) {
     if (
       !["starting", "running", "awaiting-manual"].includes(record.status)
@@ -2021,6 +2919,19 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       continue;
     }
     const child = await readChildState(record.runDir);
+    discoveryActivity.active = true;
+    discoveryActivity.cycle = record.cycle;
+    discoveryActivity.phase = child?.status ?? record.status;
+    const discoveryOperations = Object.values(child?.operations ?? {});
+    discoveryActivity.callsRunning += discoveryOperations.filter((operation) =>
+      ["started", "waiting-input"].includes(operation.status),
+    ).length;
+    discoveryActivity.callsCompleted += discoveryOperations.filter(
+      (operation) => operation.status === "completed",
+    ).length;
+    discoveryActivity.callsFailed += discoveryOperations.filter(
+      (operation) => operation.status === "failed",
+    ).length;
     for (const operation of Object.values(child?.operations ?? {})) {
       if (operation.status !== "waiting-input") continue;
       let prompt;
@@ -2055,7 +2966,10 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
     .sort((left, right) => String(left.at).localeCompare(String(right.at)))
     .slice(-200);
   const candidateEntries = entries.filter(
-    (entry) => entry.lifecycle === "candidate-review",
+    (entry) =>
+      ["solved", "human-review", "candidate-review"].includes(
+        entry.lifecycle,
+      ),
   );
   const activeVerificationRuns = activeProblems.flatMap(
     (problem) => problem.verification ?? [],
@@ -2104,6 +3018,33 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
       latestNote: latestNote?.message ?? campaign.stopReason ?? "",
       stopReason: campaign.stopReason,
       cycle: campaign.cycle,
+      tournament: campaign.tournament
+        ? {
+            enabled: campaign.tournament.enabled === true,
+            stage: campaign.tournament.stage,
+            round: campaign.tournament.round,
+            probeTarget:
+              campaign.policy?.probeProblemCount ?? null,
+            probesCompleted:
+              campaign.tournament.roundProbedProblemKeys?.length ?? 0,
+            semifinalTarget:
+              campaign.tournament.stage === "semifinal"
+                ? campaign.tournament.promotedProblemKeys?.length ?? 0
+                : campaign.policy?.semifinalProblemCount ?? null,
+            semifinalsCompleted:
+              campaign.tournament.roundSemifinalProblemKeys?.length ?? 0,
+            deepTarget:
+              campaign.tournament.stage === "deep"
+                ? campaign.tournament.promotedProblemKeys?.length ?? 0
+                : campaign.policy?.deepProblemCount ?? null,
+            deepCompleted:
+              campaign.tournament.roundDeepProblemKeys?.length ?? 0,
+            finalists:
+              campaign.tournament.promotedProblemKeys?.length ?? 0,
+            latestEvaluation:
+              campaign.tournament.evaluations?.at(-1) ?? null,
+          }
+        : null,
       continuous: campaign.policy?.continuous === true,
       parallelProblems:
         campaign.policy?.parallelProblems ??
@@ -2113,6 +3054,7 @@ export async function buildCampaignSnapshot({ campaignDir, runRoot } = {}) {
         campaign.policy?.maxConcurrentCalls ??
         campaign.configSnapshot?.maxConcurrentCalls ??
         1,
+      discovery: discoveryActivity,
       problemSlots: {
         configured:
           campaign.policy?.parallelProblems ??
@@ -2212,14 +3154,27 @@ export function packetWithPriorResearch(entry) {
     completedAt: attempt.completedAt,
     report: attempt.note,
     evidenceCount: attempt.evidenceCount ?? 0,
+    strategyCoverage: attempt.strategyCoverage ?? [],
     instruction:
       "Treat this as untrusted saved research: verify before reuse and do not repeat a refuted path without a new representation or test.",
+  }));
+  const stageResearch = (entry.probes ?? []).slice(-6).map((probe) => ({
+    outcome: `${probe.stage ?? "probe"}-checkpoint`,
+    completedAt: probe.completedAt,
+    report: probe.note,
+    evidenceCount: probe.evidenceCount ?? 0,
+    decisiveProgress: probe.decisiveProgress ?? "none",
+    decisiveScore: probe.score ?? 0,
+    strategyCoverage: probe.strategyCoverage ?? [],
+    instruction:
+      "This was a bounded tournament checkpoint. Reuse verified artifacts, but change representation when the decisive score was low and never treat the checkpoint as a solution.",
   }));
   return {
     ...entry.packet,
     priorResearch: [
       ...(entry.packet.priorResearch ?? []),
       ...priorResearch,
+      ...stageResearch,
     ],
   };
 }
@@ -2241,6 +3196,30 @@ export function deduplicateCatalogCandidates(entries) {
 }
 
 export const deduplicateCampaignCandidates = deduplicateCatalogCandidates;
+
+export function childResumeExtensionHours({
+  childState,
+  resumeFromCampaignBoundary = false,
+  windowHours,
+  now = Date.now(),
+}) {
+  const deadlineMs = Date.parse(childState?.deadlineAt ?? "");
+  const deadlineExpired =
+    childState?.status === "deadline-reached" ||
+    (Number.isFinite(deadlineMs) && now >= deadlineMs);
+  if (!resumeFromCampaignBoundary && !deadlineExpired) return 0;
+
+  const availableWindowHours = Math.max(0, Number(windowHours) || 0);
+  if (!availableWindowHours) return 0;
+  const baseDeadlineMs = Number.isFinite(deadlineMs)
+    ? Math.max(now, deadlineMs)
+    : now;
+  const targetDeadlineMs = now + availableWindowHours * HOUR_MS;
+  return Math.max(
+    0,
+    (targetDeadlineMs - baseDeadlineMs) / HOUR_MS,
+  );
+}
 
 export function isCampaignCandidateEligible(entry, { now = new Date() } = {}) {
   const instant = now instanceof Date ? now : new Date(now);
@@ -2274,6 +3253,7 @@ export function isCampaignCandidateEligible(entry, { now = new Date() } = {}) {
 export function scoreCatalogEntry(entry) {
   const packet = entry.packet ?? entry;
   const attempts = entry.attempts ?? [];
+  const probes = entry.probes ?? [];
   const completedAttempts = attempts.filter(
     (attempt) => attempt.outcome !== "failed",
   );
@@ -2283,10 +3263,17 @@ export function scoreCatalogEntry(entry) {
     if ((attempt.evidenceCount ?? 0) > 0) return 0.45;
     return 0.05;
   });
-  const empiricalProgress = progressValues.length
+  const completedProgress = progressValues.length
     ? progressValues.reduce((sum, value) => sum + value, 0) /
       progressValues.length
     : 0.5;
+  const latestProbeProgress = probes.length
+    ? clamp(Number(probes.at(-1)?.score ?? 0) / 100, 0, 1)
+    : null;
+  const empiricalProgress =
+    latestProbeProgress === null
+      ? completedProgress
+      : 0.35 * completedProgress + 0.65 * latestProbeProgress;
   const noResultAttempts = attempts.filter(
     (attempt) => !attempt.hasCandidate && attempt.outcome !== "failed",
   ).length;
@@ -2306,12 +3293,23 @@ export function scoreCatalogEntry(entry) {
     0.01,
     1,
   );
+  const artifactReadiness = clamp(
+    Number(packet.artifactReadiness ?? 3) / 5,
+    0.01,
+    1,
+  );
+  const blockingPenalty = Math.min(
+    0.3,
+    (packet.blockingDependencies?.length ?? 0) * 0.1,
+  );
   const falsification = counterexampleOpportunity(packet);
   const solvability = clamp(
-    0.7 * tractability +
+    0.45 * tractability +
       0.2 * verifiability +
-      0.1 * empiricalProgress -
-      0.12 * noResultAttempts,
+      0.2 * artifactReadiness +
+      0.15 * empiricalProgress -
+      0.12 * noResultAttempts -
+      blockingPenalty,
     0.02,
     0.95,
   );
@@ -2335,6 +3333,8 @@ export function scoreCatalogEntry(entry) {
     tractability,
     verifiability,
     sourceQuality,
+    artifactReadiness,
+    blockingPenalty,
     empiricalProgress: Number(empiricalProgress.toFixed(4)),
     noResultAttempts,
     solvability: Number(solvability.toFixed(4)),
@@ -2381,6 +3381,7 @@ export const rankCampaignCandidates = rankCatalogEntries;
 
 function resolveCampaignPolicy(config, override) {
   const configured = config.campaign ?? {};
+  const configuredTournament = configured.tournament ?? {};
   const parallelProblems = positiveInteger(
     override.parallelProblems ?? config.parallelProblems,
     "parallelProblems",
@@ -2389,7 +3390,7 @@ function resolveCampaignPolicy(config, override) {
     override.maxCalls ?? config.maxCalls,
     "maxCalls",
   );
-  return {
+  const policy = {
     durationHours: positiveNumber(
       override.durationHours ?? config.wallClockHours,
       "durationHours",
@@ -2495,7 +3496,126 @@ function resolveCampaignPolicy(config, override) {
       override.stopOnCandidate ??
       configured.stopOnCandidate ??
       false,
+    tournamentEnabled:
+      override.tournamentEnabled ??
+      configuredTournament.enabled ??
+      false,
+    probeProblemCount: positiveInteger(
+      override.probeProblemCount ??
+        configuredTournament.probeProblemCount ??
+        Math.max(8, parallelProblems * 2),
+      "probeProblemCount",
+    ),
+    probeHours: positiveNumber(
+      override.probeHours ??
+        configuredTournament.probeHours ??
+        0.5,
+      "probeHours",
+    ),
+    probeSolverTurns: positiveInteger(
+      override.probeSolverTurns ??
+        configuredTournament.probeSolverTurns ??
+        1,
+      "probeSolverTurns",
+    ),
+    minimumPromotableProbes: positiveInteger(
+      override.minimumPromotableProbes ??
+        configuredTournament.minimumPromotableProbes ??
+        Math.min(4, Math.max(1, parallelProblems)),
+      "minimumPromotableProbes",
+    ),
+    semifinalProblemCount: positiveInteger(
+      override.semifinalProblemCount ??
+        Math.min(
+          configuredTournament.semifinalProblemCount ??
+            Math.min(6, Math.max(2, parallelProblems)),
+          override.probeProblemCount ??
+            configuredTournament.probeProblemCount ??
+            Math.max(8, parallelProblems * 2),
+        ),
+      "semifinalProblemCount",
+    ),
+    semifinalSolverTurns: positiveInteger(
+      override.semifinalSolverTurns ??
+        configuredTournament.semifinalSolverTurns ??
+        2,
+      "semifinalSolverTurns",
+    ),
+    deepProblemCount: positiveInteger(
+      override.deepProblemCount ??
+        Math.min(
+          configuredTournament.deepProblemCount ??
+            Math.min(2, parallelProblems),
+          override.semifinalProblemCount ??
+            configuredTournament.semifinalProblemCount ??
+            Math.min(6, Math.max(2, parallelProblems)),
+          override.probeProblemCount ??
+            configuredTournament.probeProblemCount ??
+            Math.max(8, parallelProblems * 2),
+        ),
+      "deepProblemCount",
+    ),
+    deepSolverTurns: positiveInteger(
+      override.deepSolverTurns ??
+        configuredTournament.deepSolverTurns ??
+        4,
+      "deepSolverTurns",
+    ),
+    probePromotionScore: boundedNumber(
+      override.probePromotionScore ??
+        configuredTournament.probePromotionScore ??
+        30,
+      0,
+      100,
+      "probePromotionScore",
+    ),
+    deepPromotionScore: boundedNumber(
+      override.deepPromotionScore ??
+        configuredTournament.deepPromotionScore ??
+        50,
+      0,
+      100,
+      "deepPromotionScore",
+    ),
+    retryAfterRounds: positiveInteger(
+      override.retryAfterRounds ??
+        configuredTournament.retryAfterRounds ??
+        2,
+      "retryAfterRounds",
+    ),
+    maxStageRetries: nonNegativeInteger(
+      override.maxStageRetries ??
+        configuredTournament.maxStageRetries ??
+        2,
+      "maxStageRetries",
+    ),
+    stageHardHours: positiveNumber(
+      override.stageHardHours ??
+        configuredTournament.stageHardHours ??
+        8,
+      "stageHardHours",
+    ),
   };
+  if (policy.minimumPromotableProbes > policy.probeProblemCount) {
+    throw new Error(
+      "minimumPromotableProbes cannot exceed probeProblemCount",
+    );
+  }
+  if (policy.semifinalProblemCount > policy.probeProblemCount) {
+    throw new Error("semifinalProblemCount cannot exceed probeProblemCount");
+  }
+  if (policy.deepProblemCount > policy.semifinalProblemCount) {
+    throw new Error("deepProblemCount cannot exceed semifinalProblemCount");
+  }
+  if (
+    policy.semifinalSolverTurns < policy.probeSolverTurns ||
+    policy.deepSolverTurns < policy.semifinalSolverTurns
+  ) {
+    throw new Error(
+      "tournament solver-turn targets must increase by stage",
+    );
+  }
+  return policy;
 }
 
 function makeCatalogEntry(
@@ -2534,6 +3654,7 @@ function makeCatalogEntry(
         : now,
     },
     attempts: [],
+    probes: [],
     maxAttempts,
     cooldownUntil: null,
     lease: null,
@@ -2543,8 +3664,12 @@ function makeCatalogEntry(
   };
 }
 
-function summarizeChildAttempt(attempt, childState) {
+export function summarizeChildAttempt(attempt, childState) {
   const problem = childState.problems?.[0];
+  const solverTurns = (problem?.branches ?? []).reduce(
+    (sum, branch) => sum + (branch.history?.length ?? 0),
+    0,
+  );
   const evidenceCount =
     (problem?.evidenceKeys?.length ?? 0) +
     (problem?.branches ?? []).reduce(
@@ -2560,6 +3685,10 @@ function summarizeChildAttempt(attempt, childState) {
   const hasVerifiedPartial = (problem?.verificationRuns ?? []).some(
     (run) => run.status === "verified-partial-lead",
   );
+  const problemStatus = String(problem?.status ?? "");
+  const solved =
+    problemStatus === "candidate-complete-agent-reproduced";
+  const needsHumanReview = hasCandidate && !solved;
   const latestSynthesis = problem?.syntheses?.at(-1);
   const latestBranch = (problem?.branches ?? [])
     .flatMap((branch) =>
@@ -2569,15 +3698,13 @@ function summarizeChildAttempt(attempt, childState) {
       })),
     )
     .sort((left, right) => String(right.at).localeCompare(String(left.at)))[0];
-  const outcome = hasCandidate
-    ? "candidate"
+  const outcome = solved
+    ? "solved"
+    : needsHumanReview
+      ? "human-review"
     : childState.status?.includes("error") || problem?.status === "failed"
       ? "failed"
-      : hasVerifiedPartial
-        ? "verified-partial"
-        : evidenceCount
-          ? "progress-no-solution"
-          : "no-result";
+      : "not-solved";
   const title = problem?.packet?.title ?? attempt.problemKey;
   const detail =
     latestSynthesis?.portfolioSummary ||
@@ -2597,14 +3724,176 @@ function summarizeChildAttempt(attempt, childState) {
     hasVerifiedPartial,
     evidenceCount,
     rounds: problem?.round ?? 0,
+    solverTurns,
     callsStarted: childState.budget?.callsStarted ?? 0,
     activeWorkMs: problem?.activeWorkMs ?? 0,
+    strategyCoverage: strategyCoverageReceipt(problem),
     childStatus: childState.status,
     problemStatus: problem?.status ?? null,
-    note: hasCandidate
-      ? `Candidate reported for “${title}”: ${detail}`
-      : `“${title}” ended as ${outcome}: ${detail}`,
+    note: solved
+      ? `Solved “${title}”: the proof or counterexample passed the configured independent checks. ${detail}`
+      : needsHumanReview
+        ? `Human review recommended for “${title}”: a complete proof or counterexample passed the agent checks, but the automated system could not make a decisive final validation. ${detail}`
+        : outcome === "failed"
+          ? `Run error for “${title}”: no mathematical outcome was produced. ${detail}`
+          : `Not solved: “${title}”. ${detail}`,
   };
+}
+
+export function scoreProbeAttempt({ summary, childState }) {
+  const problem = childState?.problems?.[0];
+  const allDeltas = (problem?.branches ?? [])
+    .flatMap((branch) => branch.history ?? [])
+    .sort((left, right) => String(left.at ?? "").localeCompare(String(right.at ?? "")));
+  const stageTurnCount = Number(
+    summary?.stageSolverTurns ?? summary?.solverTurns ?? allDeltas.length,
+  );
+  const deltas =
+    stageTurnCount > 0 ? allDeltas.slice(-stageTurnCount) : [];
+  const checkableArtifacts = deltas
+    .flatMap((delta) => delta.artifacts ?? [])
+    .filter(
+      (artifact) =>
+        ["proof", "counterexample", "code", "data"].includes(
+          artifact.kind,
+        ) &&
+        String(artifact.verification ?? "").trim(),
+    ).length;
+  const verifiedFacts = (problem?.branches ?? []).reduce(
+    (count, branch) => count + (branch.verifiedFacts?.length ?? 0),
+    0,
+  );
+  const productiveDeltas = deltas.filter(
+    (delta) =>
+      ["verified-fact", "refuted-path", "search-pruning", "candidate"].includes(
+        delta.progressKind,
+      ),
+  ).length;
+  const noProgressDeltas = deltas.filter(
+    (delta) => delta.progressKind === "none",
+  ).length;
+  const concreteNextActions = deltas.filter(
+    (delta) =>
+      ["deepen", "branch", "verify"].includes(delta.nextAction) &&
+      String(delta.nextActionReason ?? "").trim(),
+  ).length;
+  const packet = problem?.packet ?? {};
+  const artifactReadiness = clamp(
+    Number(packet.artifactReadiness ?? 3),
+    1,
+    5,
+  );
+  const interest = clamp(Number(packet.interest ?? 3), 1, 5);
+  const blockerText = [
+    summary?.note,
+    problem?.stopReason,
+    ...deltas.map((delta) => delta.summary),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+  const dependencyBlocked =
+    /unavailable|cannot acquire|missing (?:dataset|incumbent|definition)|paywall|access blocked/.test(
+      blockerText,
+    );
+  const decisiveProgress = strongestDecisiveProgress(deltas);
+  const exactProblemStillOpen =
+    /(?:exact|original|unrestricted|universal|asymptotic).{0,45}(?:remains|is still)\s+open|no (?:completeness|global|unbounded) (?:argument|certificate|proof)|only (?:bounded|finite|small) cases?/i.test(
+      blockerText,
+    );
+  const solverTurns = Number(
+    summary?.stageSolverTurns ?? summary?.solverTurns ?? deltas.length,
+  );
+  const failedRun =
+    summary?.outcome === "failed" ||
+    String(summary?.childStatus ?? "").includes("error") ||
+    solverTurns <= 0;
+  const decisivePoints = {
+    none: 0,
+    "bounded-check": 8,
+    "proper-subcase": 20,
+    "reusable-lemma": 42,
+    "exact-reduction": 65,
+    "complete-candidate": 90,
+  }[decisiveProgress] ?? 0;
+  const decisiveCap = {
+    none: 15,
+    "bounded-check": 25,
+    "proper-subcase": 40,
+    "reusable-lemma": 70,
+    "exact-reduction": 90,
+    "complete-candidate": 100,
+  }[decisiveProgress] ?? 15;
+  const breakdown = {
+    checkableArtifacts,
+    verifiedFacts,
+    productiveDeltas,
+    noProgressDeltas,
+    concreteNextActions,
+    artifactReadiness,
+    interest,
+    dependencyBlocked,
+    exactProblemStillOpen,
+    decisiveProgress,
+    solverTurns,
+    failedRun,
+  };
+  const rawScore =
+    decisivePoints +
+    4 * Math.min(checkableArtifacts, 3) +
+    Math.min(verifiedFacts, 8) +
+    2 * Math.min(productiveDeltas, 4) +
+    Math.min(concreteNextActions, 2) +
+    artifactReadiness +
+    0.5 * interest -
+    3 * noProgressDeltas -
+    (dependencyBlocked ? 25 : 0) -
+    (
+      exactProblemStillOpen &&
+      !["exact-reduction", "complete-candidate"].includes(decisiveProgress)
+        ? 12
+        : 0
+    );
+  const score = failedRun
+    ? 0
+    : clamp(rawScore, 0, decisiveCap);
+  const promotable =
+    !failedRun &&
+    !dependencyBlocked &&
+    score >= 30 &&
+    ["proper-subcase", "reusable-lemma", "exact-reduction", "complete-candidate"]
+      .includes(decisiveProgress);
+  return {
+    score: Number(score.toFixed(3)),
+    breakdown,
+    promotable,
+    decisiveProgress,
+  };
+}
+
+function strongestDecisiveProgress(deltas) {
+  const order = [
+    "none",
+    "bounded-check",
+    "proper-subcase",
+    "reusable-lemma",
+    "exact-reduction",
+    "complete-candidate",
+  ];
+  return (deltas ?? []).reduce((best, delta) => {
+    const candidate = order.includes(delta.decisiveProgress)
+      ? delta.decisiveProgress
+      : delta.progressKind === "candidate"
+        ? "complete-candidate"
+        : delta.progressKind === "search-pruning"
+          ? "bounded-check"
+          : delta.progressKind === "verified-fact"
+            ? "proper-subcase"
+            : "none";
+    return order.indexOf(candidate) > order.indexOf(best)
+      ? candidate
+      : best;
+  }, "none");
 }
 
 function recordCampaignUsage(
@@ -2667,8 +3956,53 @@ function emptySlot(slotId) {
   };
 }
 
+function tournamentCompletionField(stage) {
+  if (stage === "probe" || stage === "probing") {
+    return "roundProbedProblemKeys";
+  }
+  if (stage === "semifinal") return "roundSemifinalProblemKeys";
+  if (stage === "deep") return "roundDeepProblemKeys";
+  throw new Error(`Unknown tournament stage: ${stage}`);
+}
+
+function tournamentStageLabel(stage) {
+  if (stage === "probe" || stage === "probing") return "Probe";
+  if (stage === "semifinal") return "Follow-up";
+  if (stage === "deep") return "Deep run";
+  return String(stage || "Research");
+}
+
+function createTournamentState(policy, startedAt = nowIso()) {
+  return {
+    enabled: policy.tournamentEnabled === true,
+    stage: policy.tournamentEnabled ? "probing" : "disabled",
+    round: 1,
+    roundStartedAt: startedAt,
+    roundProbedProblemKeys: [],
+    allProbedProblemKeys: [],
+    roundSemifinalProblemKeys: [],
+    roundDeepProblemKeys: [],
+    lastProbedRoundByProblem: {},
+    promotedProblemKeys: [],
+    promotedAt: null,
+    stageStartedAt: startedAt,
+    stageStartedCalls: 0,
+    rounds: [],
+    evaluations: [],
+  };
+}
+
 function migrateCampaignState(state, policy) {
   state.schemaVersion = 1;
+  state.activeClock ??= {
+    lastHeartbeatAt: state.updatedAt ?? nowIso(),
+    suspendedMs: 0,
+    lastSuspensionMs: 0,
+  };
+  state.selectionSeed ??= sha256(
+    `${state.campaignId ?? "campaign"}:${state.startedAt ?? "legacy"}`,
+  );
+  state.selectionEpoch ??= 0;
   state.budget = { ...emptyCampaignBudget(), ...(state.budget ?? {}) };
   state.budget.inFlight = 0;
   state.notes ??= [];
@@ -2685,6 +4019,45 @@ function migrateCampaignState(state, policy) {
   state.attemptsAtLastDiscovery ??= 0;
   state.stopRequestedByCandidate ??= false;
   state.stopReason ??= "";
+  if (!state.tournament) {
+    state.tournament = createTournamentState(
+      policy,
+      state.startedAt ?? nowIso(),
+    );
+    if (
+      policy.tournamentEnabled &&
+      Object.keys(state.attempts).length > 0
+    ) {
+      // Existing campaigns keep their pre-tournament scheduling semantics.
+      // A fresh campaign opts into the new lifecycle without mutating saved
+      // attempts from older releases.
+      state.tournament.enabled = false;
+      state.tournament.stage = "legacy";
+    }
+  }
+  state.tournament.round ??= 1;
+  state.tournament.roundStartedAt ??= state.startedAt ?? nowIso();
+  state.tournament.roundProbedProblemKeys ??= [];
+  state.tournament.allProbedProblemKeys ??= [];
+  state.tournament.roundSemifinalProblemKeys ??= [];
+  state.tournament.roundDeepProblemKeys ??= [];
+  state.tournament.lastProbedRoundByProblem ??= Object.fromEntries(
+    (state.tournament.allProbedProblemKeys ?? []).map((problemKey) => [
+      problemKey,
+      state.tournament.round ?? 1,
+    ]),
+  );
+  state.tournament.promotedProblemKeys ??= [];
+  state.tournament.promotedAt ??= null;
+  state.tournament.stageStartedAt ??=
+    state.tournament.roundStartedAt ?? state.startedAt ?? nowIso();
+  state.tournament.stageStartedCalls ??= state.budget.callsStarted ?? 0;
+  state.tournament.rounds ??= [];
+  state.tournament.evaluations ??= [];
+  if (state.tournament.stage === "legacy") {
+    policy.tournamentEnabled = false;
+    state.policy.tournamentEnabled = false;
+  }
 }
 
 function isChildTerminal(status) {
@@ -2801,6 +4174,24 @@ function campaignPhase(campaign, activeProblems) {
   if (activeProblems.some((problem) => problem.verification?.length)) {
     return "verifying";
   }
+  if (
+    campaign.tournament?.enabled &&
+    campaign.tournament.stage === "probing"
+  ) {
+    return activeProblems.length ? "probing" : "scouting";
+  }
+  if (
+    campaign.tournament?.enabled &&
+    campaign.tournament.stage === "semifinal"
+  ) {
+    return "testing leads";
+  }
+  if (
+    campaign.tournament?.enabled &&
+    campaign.tournament.stage === "deep"
+  ) {
+    return "deep solving";
+  }
   if (activeProblems.length) return "attacking";
   return "discovering";
 }
@@ -2809,11 +4200,14 @@ function dashboardEventLevel(level) {
   if (["warning", "error", "diagnostic", "info", "success"].includes(level)) {
     return level;
   }
-  if (["progress", "candidate", "result"].includes(level)) return "success";
+  if (["progress", "candidate", "result", "solved"].includes(level)) {
+    return "success";
+  }
   return "info";
 }
 
 function dashboardEventTitle(level) {
+  if (level === "solved") return "Solved";
   if (level === "candidate") return "Candidate found";
   if (level === "progress") return "Progress";
   if (level === "warning" || level === "error") return "Needs attention";
@@ -2847,6 +4241,14 @@ function packetFingerprint(packet) {
   return sha256(JSON.stringify(copy));
 }
 
+function normalizedCatalogTitle(value) {
+  return String(value ?? "")
+    .normalize("NFKC")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
 function positiveInteger(value, name) {
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error(`${name} must be a positive integer`);
@@ -2864,6 +4266,13 @@ function positiveNumber(value, name) {
 function nonNegativeNumber(value, name) {
   if (!Number.isFinite(value) || value < 0) {
     throw new Error(`${name} must be non-negative`);
+  }
+  return value;
+}
+
+function boundedNumber(value, min, max, name) {
+  if (!Number.isFinite(value) || value < min || value > max) {
+    throw new Error(`${name} must be between ${min} and ${max}`);
   }
   return value;
 }
